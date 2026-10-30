@@ -62,6 +62,22 @@ constexpr int kElementsPerThread = 8;
 //
 // They cross between 64 and 96, so this path keeps everything below 96. Under
 // 64 the row grid cannot fill the device at any row count.
+//
+// Re-measured after the row-per-block kernel gained a compile-time row loop
+// (see ihc_pre_accumulate() in src/iHC/iHC.cu) and a (rows, threads) tuning
+// table. That made the row path faster everywhere, but the crossover barely
+// moved: at 96 and 128 tokens it is still behind, because 128 tokens is only
+// 16-32 blocks against 78 SMs however the rows are chosen. End-to-end under
+// CUDA Graph at hidden 6144 (us per call):
+//
+//     tokens   k-split   row path (retuned)
+//         96     13.28                17.65
+//        128     13.21                17.77
+//        256     20.51                18.42
+//        512     30.68                26.35
+//
+// So the threshold stays where measurement puts it rather than being lowered to
+// hand the new path more shapes.
 constexpr int kDecodeTokenThreshold = 96;
 
 // BLOCK_K by token count: tiny batches need K cut finely to expose enough
