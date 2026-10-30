@@ -711,22 +711,51 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 namespace {
 
 constexpr int kElementsPerThread = 8;
-constexpr int kPreRowsPerBlock = 1;
 constexpr int kPostThreadsPerBlock = 128;
 
-template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
-void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
-                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
-                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
-                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
-                     cudaStream_t stream, bool use_pdl) {
+// Rows per block for the pre/head kernel, by token count. The kernel loads x
+// once per K-chunk and reuses it across all 2*hc projection rows, so giving a
+// block several rows amortizes the weight traffic -- but the accumulators
+// (acc_dot[kRowsPerBlock][kProjRows] plus acc_sqsum) are per-thread registers,
+// so the win reverses once they spill.
+//
+// Measured on H20, hidden 6144, bf16, CUDA Graph (us per call):
+//
+//     tokens   rows=1   rows=2   rows=4   rows=8   rows=16
+//         64    13.49    13.34    22.30    47.01    105.01
+//        128    17.61    13.57    23.54    46.10    106.56
+//        256    33.84    20.71    23.45    45.67    107.06
+//        320    47.88    31.67    29.12    45.76    107.29
+//       1024   114.43    81.88    69.50   131.05    163.71
+//      16384  1640.36  1077.84   950.21  2217.04   1684.79
+//
+// rows=8 and above spill (64+ fp32 accumulators per thread at rows=8) and are
+// never competitive. Small counts stay on rows=1 only because sm90 routes them
+// to the K-split path instead; see src/iHC/sm90/.
+constexpr int pre_rows_per_block(int num_batch) {
+  if (num_batch < 64) {
+    return 1;
+  }
+  if (num_batch < 320) {
+    return 2;
+  }
+  return 4;
+}
+
+template <int kHiddenDim, int kRowsPerBlock, bool kHasPost, bool kFuseRmsNorm,
+          bool kCastBfloatForNorm>
+void launch_pre_head_rows(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                          const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                          const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                          float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                          cudaStream_t stream, bool use_pdl) {
   constexpr int kThreads = 256;
-  const int num_block = (num_batch + kPreRowsPerBlock - 1) / kPreRowsPerBlock;
+  const int num_block = (num_batch + kRowsPerBlock - 1) / kRowsPerBlock;
   auto launch = [&](auto pdl_tag) {
     constexpr bool kUsePDL = decltype(pdl_tag)::value;
     auto kernel = kernels::fuse_ihc_pre_or_head_kernel<4, kHiddenDim, kElementsPerThread,
-                                                       kPreRowsPerBlock, kThreads, kHasPost,
-                                                       kUsePDL, kFuseRmsNorm, kCastBfloatForNorm>;
+                                                       kRowsPerBlock, kThreads, kHasPost, kUsePDL,
+                                                       kFuseRmsNorm, kCastBfloatForNorm>;
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(num_block);
     config.blockDim = dim3(kThreads);
@@ -747,6 +776,33 @@ void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     launch(std::true_type{});
   } else {
     launch(std::false_type{});
+  }
+}
+
+// Picks the row count from pre_rows_per_block() and forwards. Only the three
+// values that table can return are instantiated.
+template <int kHiddenDim, bool kHasPost, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+void launch_pre_head(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
+                     const __nv_bfloat16* x_ptr, const float* w_ptr, const float* hc_scale_ptr,
+                     const float* hc_base_ptr, int num_batch, float norm_eps, float hc_eps,
+                     float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps,
+                     cudaStream_t stream, bool use_pdl) {
+  switch (pre_rows_per_block(num_batch)) {
+    case 1:
+      launch_pre_head_rows<kHiddenDim, 1, kHasPost, kFuseRmsNorm, kCastBfloatForNorm>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+      break;
+    case 2:
+      launch_pre_head_rows<kHiddenDim, 2, kHasPost, kFuseRmsNorm, kCastBfloatForNorm>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+      break;
+    default:
+      launch_pre_head_rows<kHiddenDim, 4, kHasPost, kFuseRmsNorm, kCastBfloatForNorm>(
+          output_y_ptr, output_H_post_ptr, x_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+          norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps, stream, use_pdl);
+      break;
   }
 }
 
