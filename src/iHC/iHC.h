@@ -41,14 +41,10 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
 // Split-K pre dispatch uses a device-specific token threshold.
 namespace splitk {
 
-// Force controls for testing: 0=auto, 1=force split-K, 2=force row kernel.
-void ihc_set_splitk_force(int mode);
-void ihc_set_head_splitk_force(int mode);
+enum class DispatchMode { kAuto = 0, kSplitK = 1, kRow = 2 };
 
-bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
-
-size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
-                                     bool fuse_rms_norm);
+size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm,
+                                     DispatchMode mode);
 
 void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
                                const __nv_bfloat16* x_ptr, const float* w_ptr,
@@ -59,10 +55,8 @@ void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
                                float rms_eps = 0.f, bool cast_bfloat_for_norm = false);
 
 // Head shares the split-K kernels (kHasPost=false) with its own dispatch threshold.
-bool ihc_head_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
-
 size_t ihc_head_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
-                                      bool fuse_rms_norm);
+                                      bool fuse_rms_norm, DispatchMode mode);
 
 void fuse_ihc_head_splitk_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr,
                                 const float* w_ptr, const float* hc_scale_ptr,

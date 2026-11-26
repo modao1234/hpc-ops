@@ -7,7 +7,7 @@ Usage:
     # record baseline from the current build
     python3 benchmark/iHC/bench_ihc.py --jsonl baseline.jsonl
 
-    # run and compare against a saved baseline (exit 1 on >5% regression)
+    # compare against a saved baseline (exit 1 on failed timing or >5% regression)
     python3 benchmark/iHC/bench_ihc.py --check baseline.jsonl
 
     # quick smoke test
@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from math import isfinite
 from pathlib import Path
 from statistics import median
 from typing import Callable, Optional
@@ -204,8 +205,8 @@ def save_jsonl(results: list[dict], path: str) -> None:
     print(f"saved {len(results)} rows → {path}")
 
 
-def load_jsonl(path: str) -> dict[str, float]:
-    baseline: dict[str, float] = {}
+def load_jsonl(path: str) -> dict[str, float | None]:
+    baseline: dict[str, float | None] = {}
     with open(path) as f:
         for line in f:
             row = json.loads(line)
@@ -213,12 +214,12 @@ def load_jsonl(path: str) -> dict[str, float]:
     return baseline
 
 
-def compare(results: list[dict], baseline: dict[str, float], threshold: float) -> bool:
-    """Print regression table. Returns True only if at least one case was compared
-    and no case exceeded the threshold. A missing baseline entry is an error, not a pass."""
+def compare(results: list[dict], baseline: dict[str, float | None], threshold: float) -> bool:
+    """Require valid timings and no regression for every selected case."""
     regressions = []
     missing = []
     compared = 0
+    failed = 0
     for row in results:
         key = row["key"]
         if key not in baseline:
@@ -226,11 +227,12 @@ def compare(results: list[dict], baseline: dict[str, float], threshold: float) -
             continue
         base_us = baseline[key]
         head_us = row["median_us"]
-        if base_us is None or head_us is None:
-            print(f"  {'SKIP':9s}  {key:50s}  (OOM or error on this side)")
+        if any(us is None or not isfinite(us) or us <= 0 for us in (base_us, head_us)):
+            failed += 1
+            print(f"  {'ERROR':9s}  {key:50s}  (invalid timing: base={base_us!r}, head={head_us!r})")
             continue
         compared += 1
-        ratio = head_us / base_us if base_us > 0 else float("inf")
+        ratio = head_us / base_us
         status = "OK" if ratio <= 1.0 + threshold else "REGRESSED"
         if status == "REGRESSED":
             regressions.append((key, base_us, head_us, ratio))
@@ -246,6 +248,9 @@ def compare(results: list[dict], baseline: dict[str, float], threshold: float) -
         if len(missing) > 10:
             print(f"  ... and {len(missing) - 10} more")
 
+    if failed:
+        print(f"\n{failed} case(s) have failed or invalid timings.")
+
     if compared == 0:
         print("\nNOTHING COMPARED. This is not a pass.")
         return False
@@ -255,9 +260,10 @@ def compare(results: list[dict], baseline: dict[str, float], threshold: float) -
               f"{threshold*100:.0f}% threshold:")
         for key, base_us, head_us, ratio in regressions:
             print(f"  {key}  {base_us:.2f} -> {head_us:.2f} us  ({ratio:.3f}x)")
+    if missing or failed or regressions:
         return False
     print(f"\n{compared} case(s) compared, all within {threshold*100:.0f}% threshold.")
-    return not missing
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +298,7 @@ def parse_args():
     p.add_argument("--jsonl", type=str, default=None,
                    help="write results to this JSONL file (baseline save)")
     p.add_argument("--check", type=str, default=None,
-                   help="compare against this baseline JSONL; exit 1 on regression")
+                   help="compare against this baseline JSONL; exit 1 on failed timing or regression")
     p.add_argument("--threshold", type=float, default=0.05,
                    help="regression threshold as a fraction (default 0.05 = 5%%)")
     p.add_argument("--gpu", type=int, default=4,

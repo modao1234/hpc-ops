@@ -287,15 +287,8 @@ static constexpr int kStage1Threads = 128;
 static constexpr int kStage2Threads = 256;
 static constexpr int kElementsPerThread = 8;
 
-// Force controls: 0=automatic dispatch, 1=split-K, 2=row kernel.
-static int g_ihc_splitk_force = 0;
-static int g_ihc_head_splitk_force = 0;
-
 // Split-K applies below a device- and shape-dependent token threshold.
 static int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
-  if (g_ihc_splitk_force == 1) return 1 << 30;
-  if (g_ihc_splitk_force == 2) return 0;
-
   constexpr float kSmPerBlockRow = 1.2f;
   constexpr float kFoldScale = 1.2f;
   constexpr int kHiddenRef = 6144;
@@ -351,8 +344,6 @@ static constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
 }
 
 static int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
-  if (g_ihc_head_splitk_force == 1) return 1 << 30;
-  if (g_ihc_head_splitk_force == 2) return 0;
   constexpr float kSmPerBlockRow = 0.75f;
   constexpr float kFoldScale = 0.8f;
   constexpr int kHiddenRef = 6144;
@@ -462,11 +453,8 @@ void launch_splitk_by_block_k(__nv_bfloat16* output_y_ptr, float* output_H_post_
   }
 }
 
-void ihc_set_splitk_force(int mode) { g_ihc_splitk_force = mode; }
-void ihc_set_head_splitk_force(int mode) { g_ihc_head_splitk_force = mode; }
-
-bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm) {
-  if (hc_mult != 4) {
+static bool splitk_shape_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm) {
+  if (num_batch <= 0 || hc_mult != 4) {
     return false;
   }
   // The folded stage2 puts the whole row in one block, so the thread count
@@ -474,16 +462,15 @@ bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool f
   if (fuse_rms_norm && hidden_dim / kElementsPerThread > 1024) {
     return false;
   }
-  if (hidden_dim != 3072 && hidden_dim != 4096 && hidden_dim != 6144) {
-    return false;
-  }
-  // Check shape before threshold: threshold scales with hidden_dim.
-  return num_batch > 0 && num_batch < splitk_token_threshold(hidden_dim, fuse_rms_norm);
+  return hidden_dim == 3072 || hidden_dim == 4096 || hidden_dim == 6144;
 }
 
-size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
-                                     bool fuse_rms_norm) {
-  if (!ihc_pre_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
+size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm,
+                                     DispatchMode mode) {
+  if (mode == DispatchMode::kRow ||
+      !splitk_shape_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm) ||
+      (mode == DispatchMode::kAuto &&
+       num_batch >= splitk_token_threshold(hidden_dim, fuse_rms_norm))) {
     return 0;
   }
   const int num_splits = (hc_mult * hidden_dim) / splitk_block_k(num_batch);
@@ -525,22 +512,12 @@ void fuse_ihc_pre_splitk_async(__nv_bfloat16* output_y_ptr, float* output_H_post
   }
 }
 
-bool ihc_head_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm) {
-  if (hc_mult != 4) {
-    return false;
-  }
-  if (fuse_rms_norm && hidden_dim / kElementsPerThread > 1024) {
-    return false;
-  }
-  if (hidden_dim != 3072 && hidden_dim != 4096 && hidden_dim != 6144) {
-    return false;
-  }
-  return num_batch > 0 && num_batch < head_splitk_token_threshold(hidden_dim, fuse_rms_norm);
-}
-
 size_t ihc_head_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
-                                      bool fuse_rms_norm) {
-  if (!ihc_head_splitk_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm)) {
+                                      bool fuse_rms_norm, DispatchMode mode) {
+  if (mode == DispatchMode::kRow ||
+      !splitk_shape_supported(num_batch, hc_mult, hidden_dim, fuse_rms_norm) ||
+      (mode == DispatchMode::kAuto &&
+       num_batch >= head_splitk_token_threshold(hidden_dim, fuse_rms_norm))) {
     return 0;
   }
   const int num_splits = (hc_mult * hidden_dim) / head_splitk_block_k(num_batch, hidden_dim);

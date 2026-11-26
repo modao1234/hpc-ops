@@ -38,124 +38,130 @@ __device__ __forceinline__ float2 ihc_mul2(float2 a, float2 b) {
   return c;
 }
 
-template <bool Aligned32 = false>
-__device__ __forceinline__ vec_t<float, 8> ihc_load_weight8(const float* p) {
-  vec_t<float, 8> v;
+template <bool kWeightsAligned32 = false>
+__device__ __forceinline__ vec_t<float, 8> ihc_load_weight8(const float* weight_ptr) {
+  vec_t<float, 8> weights;
 #if defined(CUTE_ARCH_LOAD256_SM100A_ENABLED)
-  if constexpr (Aligned32) {
+  if constexpr (kWeightsAligned32) {
     asm volatile("ld.global.v8.f32 {%0,%1,%2,%3,%4,%5,%6,%7},[%8];"
-                 : "=f"(v[0]), "=f"(v[1]), "=f"(v[2]), "=f"(v[3]), "=f"(v[4]), "=f"(v[5]),
-                   "=f"(v[6]), "=f"(v[7])
-                 : "l"(p));
-    return v;
+                 : "=f"(weights[0]), "=f"(weights[1]), "=f"(weights[2]), "=f"(weights[3]),
+                   "=f"(weights[4]), "=f"(weights[5]), "=f"(weights[6]), "=f"(weights[7])
+                 : "l"(weight_ptr));
+    return weights;
   }
 #endif
-  *reinterpret_cast<vec_t<float, 4>*>(&v[0]) = load<float, 4>(p);
-  *reinterpret_cast<vec_t<float, 4>*>(&v[4]) = load<float, 4>(p + 4);
-  return v;
+  *reinterpret_cast<vec_t<float, 4>*>(&weights[0]) = load<float, 4>(weight_ptr);
+  *reinterpret_cast<vec_t<float, 4>*>(&weights[4]) = load<float, 4>(weight_ptr + 4);
+  return weights;
 }
 
 // Accumulate two projection rows in FP32, reusing each input vector.
-template <int N>
-__device__ __forceinline__ void ihc_dot_pair(float& acc0, float& acc1, const vec_t<float, N>& x,
-                                             const vec_t<float, N>& w0, const vec_t<float, N>& w1) {
+template <int kElementsPerThread>
+__device__ __forceinline__ void ihc_dot_pair(float& acc0, float& acc1,
+                                             const vec_t<float, kElementsPerThread>& values,
+                                             const vec_t<float, kElementsPerThread>& weights0,
+                                             const vec_t<float, kElementsPerThread>& weights1) {
   float2 acc = make_float2(acc0, acc1);
 #pragma unroll
-  for (int j = 0; j < N; ++j) {
-    acc.x += x[j] * w0[j];
-    acc.y += x[j] * w1[j];
+  for (int j = 0; j < kElementsPerThread; ++j) {
+    acc.x += values[j] * weights0[j];
+    acc.y += values[j] * weights1[j];
   }
   acc0 = acc.x;
   acc1 = acc.y;
 }
 
-template <int HC, int D, int E, int Rows, int Threads, int ThreadsPerRow, bool FuseNorm,
-          bool CastBfloat>
-__device__ __forceinline__ void ihc_mix_epilogue(__nv_bfloat16* out, const __nv_bfloat16* x,
-                                                 const float* gates, int row_base, int valid_rows,
-                                                 const __nv_bfloat16* gamma, float eps,
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kRowsPerBlock,
+          int kThreadsPerBlock, int kThreadsPerRow, bool kFuseRmsNorm, bool kCastBfloatForNorm>
+__device__ __forceinline__ void ihc_mix_epilogue(__nv_bfloat16* z_ptr, const __nv_bfloat16* y_ptr,
+                                                 const float* pre_gates_ptr, int row_base,
+                                                 int valid_rows,
+                                                 const __nv_bfloat16* rms_weight_ptr, float rms_eps,
                                                  float* norm_partial) {
-  static_assert(ThreadsPerRow % 32 == 0 && Threads % ThreadsPerRow == 0,
+  static_assert(kThreadsPerRow % 32 == 0 && kThreadsPerBlock % kThreadsPerRow == 0,
                 "each row group must contain whole warps");
-  static_assert(D % (ThreadsPerRow * E) == 0, "row span must divide hidden size");
-  constexpr int Groups = Threads / ThreadsPerRow;
-  constexpr int WarpsPerRow = ThreadsPerRow / 32;
-  constexpr int Chunks = D / (ThreadsPerRow * E);
-  const int group = threadIdx.x / ThreadsPerRow;
-  const int tid = threadIdx.x % ThreadsPerRow;
+  static_assert(kHiddenDim % (kThreadsPerRow * kElementsPerThread) == 0,
+                "row span must divide hidden size");
+  constexpr int kRowGroups = kThreadsPerBlock / kThreadsPerRow;
+  constexpr int kWarpsPerRow = kThreadsPerRow / 32;
+  constexpr int kChunksPerRow = kHiddenDim / (kThreadsPerRow * kElementsPerThread);
+  const int group = threadIdx.x / kThreadsPerRow;
+  const int tid = threadIdx.x % kThreadsPerRow;
 
 #pragma unroll 1
-  for (int wave = 0; wave < (Rows + Groups - 1) / Groups; ++wave) {
-    const int r = wave * Groups + group;
+  for (int wave = 0; wave < (kRowsPerBlock + kRowGroups - 1) / kRowGroups; ++wave) {
+    const int r = wave * kRowGroups + group;
     const bool valid = r < valid_rows;
-    using Saved = std::conditional_t<FuseNorm && CastBfloat, __nv_bfloat16, float>;
-    vec_t<Saved, E> saved[Chunks];
-    float sqsum = 0.f;
+    using SavedOutput =
+        std::conditional_t<kFuseRmsNorm && kCastBfloatForNorm, __nv_bfloat16, float>;
+    vec_t<SavedOutput, kElementsPerThread> saved[kChunksPerRow];
+    float output_sqsum = 0.f;
     if (valid) {
-      const auto h = load<float, HC>(gates + r * HC);
-      const auto* xr = x + static_cast<int64_t>(row_base + r) * HC * D;
-      auto* yr = out + static_cast<int64_t>(row_base + r) * D;
+      const auto h = load<float, kHCMult>(pre_gates_ptr + r * kHCMult);
+      const auto* y_row_ptr = y_ptr + static_cast<int64_t>(row_base + r) * kHCMult * kHiddenDim;
+      auto* z_row_ptr = z_ptr + static_cast<int64_t>(row_base + r) * kHiddenDim;
 #pragma unroll
-      for (int ch = 0; ch < Chunks; ++ch) {
-        const int col = (ch * ThreadsPerRow + tid) * E;
-        vec_t<float, E> y;
+      for (int ch = 0; ch < kChunksPerRow; ++ch) {
+        const int col = (ch * kThreadsPerRow + tid) * kElementsPerThread;
+        vec_t<float, kElementsPerThread> y;
 #pragma unroll
-        for (int j = 0; j < E; ++j) {
+        for (int j = 0; j < kElementsPerThread; ++j) {
           y[j] = 0.f;
         }
         auto* y2 = reinterpret_cast<float2*>(&y[0]);
 #pragma unroll
-        for (int c = 0; c < HC; ++c) {
-          const auto v = to<float>(load<__nv_bfloat16, E>(xr + c * D + col));
+        for (int c = 0; c < kHCMult; ++c) {
+          const auto v =
+              to<float>(load<__nv_bfloat16, kElementsPerThread>(y_row_ptr + c * kHiddenDim + col));
           const auto* v2 = reinterpret_cast<const float2*>(&v[0]);
 #pragma unroll
-          for (int j = 0; j < E / 2; ++j) {
+          for (int j = 0; j < kElementsPerThread / 2; ++j) {
             y2[j] = ihc_fma2(make_float2(h[c], h[c]), v2[j], y2[j]);
           }
         }
-        if constexpr (FuseNorm) {
-          if constexpr (CastBfloat) {
+        if constexpr (kFuseRmsNorm) {
+          if constexpr (kCastBfloatForNorm) {
             saved[ch] = to<__nv_bfloat16>(y);
             y = to<float>(saved[ch]);
           } else {
             saved[ch] = y;
           }
 #pragma unroll
-          for (int j = 0; j < E; ++j) {
-            sqsum += y[j] * y[j];
+          for (int j = 0; j < kElementsPerThread; ++j) {
+            output_sqsum += y[j] * y[j];
           }
         } else {
-          store(yr + col, to<__nv_bfloat16>(y));
+          store(z_row_ptr + col, to<__nv_bfloat16>(y));
         }
       }
     }
 
-    if constexpr (FuseNorm) {
-      const float v = warp_reduce_sum_xor(sqsum);
-      if ((tid % 32) == 0 && r < Rows) {
-        norm_partial[r * WarpsPerRow + tid / 32] = v;
+    if constexpr (kFuseRmsNorm) {
+      const float v = warp_reduce_sum_xor(output_sqsum);
+      if ((tid % 32) == 0 && r < kRowsPerBlock) {
+        norm_partial[r * kWarpsPerRow + tid / 32] = v;
       }
       __syncthreads();
       if (valid) {
         float total = 0.f;
 #pragma unroll
-        for (int w = 0; w < WarpsPerRow; ++w) {
-          total += norm_partial[r * WarpsPerRow + w];
+        for (int w = 0; w < kWarpsPerRow; ++w) {
+          total += norm_partial[r * kWarpsPerRow + w];
         }
-        const float scale = rsqrtf_ftz(total * (1.f / D) + eps);
-        auto* yr = out + static_cast<int64_t>(row_base + r) * D;
+        const float scale = rsqrtf_ftz(total * (1.f / kHiddenDim) + rms_eps);
+        auto* z_row_ptr = z_ptr + static_cast<int64_t>(row_base + r) * kHiddenDim;
 #pragma unroll
-        for (int ch = 0; ch < Chunks; ++ch) {
-          const int col = (ch * ThreadsPerRow + tid) * E;
-          const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+        for (int ch = 0; ch < kChunksPerRow; ++ch) {
+          const int col = (ch * kThreadsPerRow + tid) * kElementsPerThread;
+          const auto g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + col));
           auto y = to<float>(saved[ch]);
           auto* y2 = reinterpret_cast<float2*>(&y[0]);
           const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
 #pragma unroll
-          for (int j = 0; j < E / 2; ++j) {
+          for (int j = 0; j < kElementsPerThread / 2; ++j) {
             y2[j] = ihc_mul2(ihc_mul2(y2[j], make_float2(scale, scale)), g2[j]);
           }
-          store(yr + col, to<__nv_bfloat16>(y));
+          store(z_row_ptr + col, to<__nv_bfloat16>(y));
         }
       }
     }
@@ -167,373 +173,404 @@ namespace kernels {
 // Number of blocks per cluster for the fused post-pre cluster and UMMA paths.
 constexpr int ihc_post_pre_num_blocks(int hidden_dim) { return hidden_dim == 3072 ? 6 : 8; }
 
-template <int D, int Blocks, bool Norm, bool Cast, bool PDL = false>
+template <int kHiddenDim, int kBlocksPerCluster, bool kFuseRmsNorm, bool kCastBfloatForNorm,
+          bool kUsePDL = false>
 __device__ __forceinline__ void ihc_post_pre_cluster_device(
-    __nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
-    const __nv_bfloat16* residual, const float* hi, const float* w, const float* scale,
-    const float* bias, int m, float eps, float hc_eps, float magnitude, const __nv_bfloat16* gamma,
-    float rms_eps) {
-  constexpr int E = 8, T = D / (Blocks * E), Slice = D / Blocks, Warps = T / 32;
-  static_assert(D % (Blocks * E) == 0 && T % 32 == 0, "shards must contain whole warps");
-  static_assert(Blocks <= 8, "use a portable cluster size");
+    __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
+    const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
+    const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch, float norm_eps,
+    float hc_eps, float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
+  constexpr int kElementsPerThread = 8,
+                kThreadsPerBlock = kHiddenDim / (kBlocksPerCluster * kElementsPerThread),
+                kHiddenPerBlock = kHiddenDim / kBlocksPerCluster,
+                kWarpsPerBlock = kThreadsPerBlock / 32;
+  static_assert(
+      kHiddenDim % (kBlocksPerCluster * kElementsPerThread) == 0 && kThreadsPerBlock % 32 == 0,
+      "shards must contain whole warps");
+  static_assert(kBlocksPerCluster <= 8, "use a portable cluster size");
   const auto cluster = cooperative_groups::this_cluster();
-  const int rank = cluster.block_rank(), row = blockIdx.x / Blocks;
-  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, col = rank * Slice + tid * E;
-  struct Smem {
-    float partial[9][Warps];
-    float sums[9], gates[4], norm[Warps], normsum, normscale;
+  const int rank = cluster.block_rank(), row = blockIdx.x / kBlocksPerCluster;
+  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32,
+            col = rank * kHiddenPerBlock + tid * kElementsPerThread;
+  struct SharedStorage {
+    float partial[9][kWarpsPerBlock];
+    float sums[9], pre_gates[4], norm[kWarpsPerBlock], norm_sum, norm_scale;
   };
-  __shared__ Smem s;
-  if constexpr (PDL) cudaGridDependencySynchronize();
-  float dot[8] = {}, sq = 0.f;
-  vec_t<__nv_bfloat16, E> cache[4];
-  const auto a = to<float>(load<__nv_bfloat16, E>(xa + static_cast<int64_t>(row) * D + col));
-  const auto h = load<float, 4>(hi + row * 4);
+  __shared__ SharedStorage smem;
+  if constexpr (kUsePDL) cudaGridDependencySynchronize();
+  float acc_dot[8] = {}, acc_sqsum = 0.f;
+  vec_t<__nv_bfloat16, kElementsPerThread> post_output_cache[4];
+  const auto a = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+      xa_ptr + static_cast<int64_t>(row) * kHiddenDim + col));
+  const auto h = load<float, 4>(H_post_in_ptr + row * 4);
 #pragma unroll
   for (int c = 0; c < 4; ++c) {
-    const int64_t flat = static_cast<int64_t>(row) * 4 * D + c * D + col;
-    const auto b = to<float>(load<__nv_bfloat16, E>(residual + flat));
-    vec_t<float, E> v;
+    const int64_t flat = static_cast<int64_t>(row) * 4 * kHiddenDim + c * kHiddenDim + col;
+    const auto b = to<float>(load<__nv_bfloat16, kElementsPerThread>(residual_ptr + flat));
+    vec_t<float, kElementsPerThread> v;
     auto* v2 = reinterpret_cast<float2*>(&v[0]);
     const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
     const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
 #pragma unroll
-    for (int j = 0; j < E / 2; ++j) v2[j] = ihc_fma2(make_float2(h[c], h[c]), a2[j], b2[j]);
+    for (int j = 0; j < kElementsPerThread / 2; ++j)
+      v2[j] = ihc_fma2(make_float2(h[c], h[c]), a2[j], b2[j]);
     const auto bf = to<__nv_bfloat16>(v);
-    store(y + flat, bf);
-    cache[c] = bf;
+    store(y_ptr + flat, bf);
+    post_output_cache[c] = bf;
     v = to<float>(bf);
 #pragma unroll
-    for (int j = 0; j < E; ++j) sq += v[j] * v[j];
+    for (int j = 0; j < kElementsPerThread; ++j) acc_sqsum += v[j] * v[j];
 #pragma unroll
     for (int p = 0; p < 8; ++p) {
-      vec_t<float, E> weights;
-      const float* wp = w + static_cast<int64_t>(p) * 4 * D + c * D + col;
+      vec_t<float, kElementsPerThread> weights;
+      const float* wp = w_ptr + static_cast<int64_t>(p) * 4 * kHiddenDim + c * kHiddenDim + col;
       *reinterpret_cast<vec_t<float, 4>*>(&weights[0]) = load<float, 4>(wp);
       *reinterpret_cast<vec_t<float, 4>*>(&weights[4]) = load<float, 4>(wp + 4);
 #pragma unroll
-      for (int j = 0; j < E; ++j) dot[p] += v[j] * weights[j];
+      for (int j = 0; j < kElementsPerThread; ++j) acc_dot[p] += v[j] * weights[j];
     }
   }
 #pragma unroll
   for (int p = 0; p < 8; ++p) {
-    const float v = warp_reduce_sum_xor(dot[p]);
-    if (lane == 0) s.partial[p][warp] = v;
+    const float v = warp_reduce_sum_xor(acc_dot[p]);
+    if (lane == 0) smem.partial[p][warp] = v;
   }
-  const float v = warp_reduce_sum_xor(sq);
-  if (lane == 0) s.partial[8][warp] = v;
+  const float v = warp_reduce_sum_xor(acc_sqsum);
+  if (lane == 0) smem.partial[8][warp] = v;
   __syncthreads();
   if (tid < 9) {
     float total = 0;
 #pragma unroll
-    for (int k = 0; k < Warps; ++k) total += s.partial[tid][k];
-    s.sums[tid] = total;
+    for (int k = 0; k < kWarpsPerBlock; ++k) total += smem.partial[tid][k];
+    smem.sums[tid] = total;
   }
   // Publish all projection and input-norm partials before any DSM reads.
   cluster.sync();
   if (tid < 4) {
     float pre = 0, post = 0, total = 0;
 #pragma unroll
-    for (int k = 0; k < Blocks; ++k) {
-      const auto* peer = cluster.map_shared_rank(&s, k);
+    for (int k = 0; k < kBlocksPerCluster; ++k) {
+      const auto* peer = cluster.map_shared_rank(&smem, k);
       pre += peer->sums[tid];
       post += peer->sums[tid + 4];
       total += peer->sums[8];
     }
-    const float r = rsqrtf_ftz(total * (1.f / (4 * D)) + eps);
-    s.gates[tid] = sigmoid(scale[0] * (pre * r) + bias[tid]) + hc_eps;
+    const float r = rsqrtf_ftz(total * (1.f / (4 * kHiddenDim)) + norm_eps);
+    smem.pre_gates[tid] = sigmoid(hc_scale_ptr[0] * (pre * r) + hc_base_ptr[tid]) + hc_eps;
     if (rank == 0)
-      hp[row * 4 + tid] = magnitude * sigmoid(scale[1] * (post * r) + bias[tid + 4]) + hc_eps;
+      H_post_out_ptr[row * 4 + tid] =
+          magnitude * sigmoid(hc_scale_ptr[1] * (post * r) + hc_base_ptr[tid + 4]) + hc_eps;
   }
   __syncthreads();
-  vec_t<float, E> out;
+  vec_t<float, kElementsPerThread> out;
 #pragma unroll
-  for (int j = 0; j < E; ++j) out[j] = 0;
+  for (int j = 0; j < kElementsPerThread; ++j) out[j] = 0;
   auto* o2 = reinterpret_cast<float2*>(&out[0]);
 #pragma unroll
   for (int c = 0; c < 4; ++c) {
-    const auto in = to<float>(cache[c]);
+    const auto in = to<float>(post_output_cache[c]);
     const auto* i2 = reinterpret_cast<const float2*>(&in[0]);
 #pragma unroll
-    for (int j = 0; j < E / 2; ++j)
-      o2[j] = ihc_fma2(make_float2(s.gates[c], s.gates[c]), i2[j], o2[j]);
+    for (int j = 0; j < kElementsPerThread / 2; ++j)
+      o2[j] = ihc_fma2(make_float2(smem.pre_gates[c], smem.pre_gates[c]), i2[j], o2[j]);
   }
-  if constexpr (Norm) {
-    if constexpr (Cast) out = to<float>(to<__nv_bfloat16>(out));
-    float osq = 0;
+  if constexpr (kFuseRmsNorm) {
+    if constexpr (kCastBfloatForNorm) out = to<float>(to<__nv_bfloat16>(out));
+    float output_sqsum = 0;
 #pragma unroll
-    for (int j = 0; j < E; ++j) osq += out[j] * out[j];
-    const float t = warp_reduce_sum_xor(osq);
-    if (lane == 0) s.norm[warp] = t;
+    for (int j = 0; j < kElementsPerThread; ++j) output_sqsum += out[j] * out[j];
+    const float t = warp_reduce_sum_xor(output_sqsum);
+    if (lane == 0) smem.norm[warp] = t;
     __syncthreads();
     if (tid == 0) {
       float total = 0;
 #pragma unroll
-      for (int k = 0; k < Warps; ++k) total += s.norm[k];
-      s.normsum = total;
+      for (int k = 0; k < kWarpsPerBlock; ++k) total += smem.norm[k];
+      smem.norm_sum = total;
     }
     // Publish output-norm partials; gate reads have already completed.
     cluster.sync();
     if (tid == 0) {
       float total = 0;
 #pragma unroll
-      for (int k = 0; k < Blocks; ++k) total += cluster.map_shared_rank(&s, k)->normsum;
-      s.normscale = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+      for (int k = 0; k < kBlocksPerCluster; ++k)
+        total += cluster.map_shared_rank(&smem, k)->norm_sum;
+      smem.norm_scale = rsqrtf_ftz(total * (1.f / kHiddenDim) + rms_eps);
     }
     __syncthreads();
     // Retire remote reads while gamma loads and final stores are in flight.
     cluster.barrier_arrive();
-    const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+    const auto g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + col));
     const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
 #pragma unroll
-    for (int j = 0; j < E / 2; ++j)
-      o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(s.normscale, s.normscale)), g2[j]);
+    for (int j = 0; j < kElementsPerThread / 2; ++j)
+      o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(smem.norm_scale, smem.norm_scale)), g2[j]);
   } else {
     cluster.barrier_arrive();
   }
-  store(z + static_cast<int64_t>(row) * D + col, to<__nv_bfloat16>(out));
+  store(z_ptr + static_cast<int64_t>(row) * kHiddenDim + col, to<__nv_bfloat16>(out));
   // Remote DSM readers must finish before any owning CTA exits.
   cluster.barrier_wait();
-  if constexpr (PDL) cudaTriggerProgrammaticLaunchCompletion();
+  if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
 }
 
-template <int D, int T, bool Norm, bool Cast, bool PDL = false, bool Aligned32 = false,
-          bool PairFma = false, bool RetainResidual = true>
+template <int kHiddenDim, int kThreadsPerBlock, bool kFuseRmsNorm, bool kCastBfloatForNorm,
+          bool kUsePDL = false, bool kWeightsAligned32 = false, bool kUsePairFma = false,
+          bool kRetainPostOutput = true>
 __device__ __forceinline__ void ihc_post_pre_single_row_device(
-    __nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
-    const __nv_bfloat16* res, const float* hi, const float* w, const float* scale,
-    const float* bias, int m, float eps, float hc_eps, float mag, const __nv_bfloat16* gamma,
-    float rms_eps) {
-  constexpr int E = 8, C = D / (T * E), Warps = T / 32;
-  static_assert(T % 32 == 0 && D % (T * E) == 0, "whole warps and complete column tiles");
+    __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
+    const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
+    const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch, float norm_eps,
+    float hc_eps, float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
+  constexpr int kElementsPerThread = 8,
+                kChunksPerRow = kHiddenDim / (kThreadsPerBlock * kElementsPerThread),
+                kWarpsPerBlock = kThreadsPerBlock / 32;
+  static_assert(
+      kThreadsPerBlock % 32 == 0 && kHiddenDim % (kThreadsPerBlock * kElementsPerThread) == 0,
+      "whole warps and complete column tiles");
   const int row = blockIdx.x, tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-  if constexpr (PDL) cudaGridDependencySynchronize();
-  __shared__ float part[9][Warps];
-  __shared__ float gates[4], norm[Warps], rn;
-  vec_t<__nv_bfloat16, E> cache[C][4];
-  float dot[8] = {}, sq = 0;
-  auto h = load<float, 4>(hi + row * 4);
+  if constexpr (kUsePDL) cudaGridDependencySynchronize();
+  __shared__ float smem_partial[9][kWarpsPerBlock];
+  __shared__ float smem_pre_gates[4], smem_norm_partial[kWarpsPerBlock], smem_rms_inv;
+  vec_t<__nv_bfloat16, kElementsPerThread> post_output_cache[kChunksPerRow][4];
+  float acc_dot[8] = {}, acc_sqsum = 0;
+  auto h = load<float, 4>(H_post_in_ptr + row * 4);
 #pragma unroll
-  for (int ch = 0; ch < C; ++ch) {
-    int col = (ch * T + tid) * E;
-    auto a = to<float>(load<__nv_bfloat16, E>(xa + static_cast<int64_t>(row) * D + col));
+  for (int ch = 0; ch < kChunksPerRow; ++ch) {
+    int col = (ch * kThreadsPerBlock + tid) * kElementsPerThread;
+    auto a = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+        xa_ptr + static_cast<int64_t>(row) * kHiddenDim + col));
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      auto b =
-          to<float>(load<__nv_bfloat16, E>(res + static_cast<int64_t>(row) * 4 * D + i * D + col));
-      vec_t<float, E> v;
+      auto b = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+          residual_ptr + static_cast<int64_t>(row) * 4 * kHiddenDim + i * kHiddenDim + col));
+      vec_t<float, kElementsPerThread> v;
       auto* v2 = reinterpret_cast<float2*>(&v[0]);
       const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
       const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
 #pragma unroll
-      for (int j = 0; j < E / 2; ++j) v2[j] = ihc_fma2(make_float2(h[i], h[i]), a2[j], b2[j]);
+      for (int j = 0; j < kElementsPerThread / 2; ++j)
+        v2[j] = ihc_fma2(make_float2(h[i], h[i]), a2[j], b2[j]);
       auto bf = to<__nv_bfloat16>(v);
-      if constexpr (RetainResidual) {
-        cache[ch][i] = bf;
+      if constexpr (kRetainPostOutput) {
+        post_output_cache[ch][i] = bf;
       }
-      store(y + static_cast<int64_t>(row) * 4 * D + i * D + col, bf);
+      store(y_ptr + static_cast<int64_t>(row) * 4 * kHiddenDim + i * kHiddenDim + col, bf);
       v = to<float>(bf);
 #pragma unroll
-      for (int j = 0; j < E; ++j) sq += v[j] * v[j];
-      if constexpr (PairFma) {
+      for (int j = 0; j < kElementsPerThread; ++j) acc_sqsum += v[j] * v[j];
+      if constexpr (kUsePairFma) {
 #pragma unroll
         for (int p = 0; p < 8; p += 2) {
-          const auto* wp = w + static_cast<int64_t>(p) * 4 * D + i * D + col;
-          const auto w0 = ihc_load_weight8<Aligned32>(wp);
-          const auto w1 = ihc_load_weight8<Aligned32>(wp + 4 * D);
-          auto acc = make_float2(dot[p], dot[p + 1]);
+          const auto* wp = w_ptr + static_cast<int64_t>(p) * 4 * kHiddenDim + i * kHiddenDim + col;
+          const auto w0 = ihc_load_weight8<kWeightsAligned32>(wp);
+          const auto w1 = ihc_load_weight8<kWeightsAligned32>(wp + 4 * kHiddenDim);
+          auto acc = make_float2(acc_dot[p], acc_dot[p + 1]);
 #pragma unroll
-          for (int j = 0; j < E; ++j)
+          for (int j = 0; j < kElementsPerThread; ++j)
             acc = ihc_fma2(make_float2(v[j], v[j]), make_float2(w0[j], w1[j]), acc);
-          dot[p] = acc.x;
-          dot[p + 1] = acc.y;
+          acc_dot[p] = acc.x;
+          acc_dot[p + 1] = acc.y;
         }
       } else {
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
-          vec_t<float, E> ww;
-          auto wp = w + static_cast<int64_t>(p) * 4 * D + i * D + col;
-          ww = ihc_load_weight8<Aligned32>(wp);
+          vec_t<float, kElementsPerThread> ww;
+          auto wp = w_ptr + static_cast<int64_t>(p) * 4 * kHiddenDim + i * kHiddenDim + col;
+          ww = ihc_load_weight8<kWeightsAligned32>(wp);
 #pragma unroll
-          for (int j = 0; j < E; ++j) dot[p] += v[j] * ww[j];
+          for (int j = 0; j < kElementsPerThread; ++j) acc_dot[p] += v[j] * ww[j];
         }
       }
     }
   }
 #pragma unroll
   for (int p = 0; p < 8; ++p) {
-    float v = warp_reduce_sum_xor(dot[p]);
-    if (lane == 0) part[p][warp] = v;
+    float v = warp_reduce_sum_xor(acc_dot[p]);
+    if (lane == 0) smem_partial[p][warp] = v;
   }
-  float v = warp_reduce_sum_xor(sq);
-  if (lane == 0) part[8][warp] = v;
+  float v = warp_reduce_sum_xor(acc_sqsum);
+  if (lane == 0) smem_partial[8][warp] = v;
   __syncthreads();
   if (tid < 4) {
     float pre = 0, post = 0, total = 0;
 #pragma unroll
-    for (int k = 0; k < Warps; ++k) {
-      pre += part[tid][k];
-      post += part[tid + 4][k];
-      total += part[8][k];
+    for (int k = 0; k < kWarpsPerBlock; ++k) {
+      pre += smem_partial[tid][k];
+      post += smem_partial[tid + 4][k];
+      total += smem_partial[8][k];
     }
-    float r = rsqrtf_ftz(total * (1.f / (4 * D)) + eps);
-    gates[tid] = sigmoid(scale[0] * (pre * r) + bias[tid]) + hc_eps;
-    hp[row * 4 + tid] = mag * sigmoid(scale[1] * (post * r) + bias[tid + 4]) + hc_eps;
+    float r = rsqrtf_ftz(total * (1.f / (4 * kHiddenDim)) + norm_eps);
+    smem_pre_gates[tid] = sigmoid(hc_scale_ptr[0] * (pre * r) + hc_base_ptr[tid]) + hc_eps;
+    H_post_out_ptr[row * 4 + tid] =
+        magnitude * sigmoid(hc_scale_ptr[1] * (post * r) + hc_base_ptr[tid + 4]) + hc_eps;
   }
   __syncthreads();
-  using Saved = std::conditional_t<Norm && Cast, __nv_bfloat16, float>;
-  vec_t<Saved, E> saved[C];
-  float osq = 0;
+  using SavedOutput = std::conditional_t<kFuseRmsNorm && kCastBfloatForNorm, __nv_bfloat16, float>;
+  vec_t<SavedOutput, kElementsPerThread> saved[kChunksPerRow];
+  float output_sqsum = 0;
 #pragma unroll
-  for (int ch = 0; ch < C; ++ch) {
-    vec_t<float, E> out;
-    for (int j = 0; j < E; ++j) out[j] = 0;
+  for (int ch = 0; ch < kChunksPerRow; ++ch) {
+    vec_t<float, kElementsPerThread> out;
+    for (int j = 0; j < kElementsPerThread; ++j) out[j] = 0;
     auto* o2 = reinterpret_cast<float2*>(&out[0]);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      vec_t<__nv_bfloat16, E> values;
-      if constexpr (RetainResidual) {
-        values = cache[ch][i];
+      vec_t<__nv_bfloat16, kElementsPerThread> values;
+      if constexpr (kRetainPostOutput) {
+        values = post_output_cache[ch][i];
       } else {
-        const int col = (ch * T + tid) * E;
-        values = load<__nv_bfloat16, E>(y + static_cast<int64_t>(row) * 4 * D + i * D + col);
+        const int col = (ch * kThreadsPerBlock + tid) * kElementsPerThread;
+        values = load<__nv_bfloat16, kElementsPerThread>(
+            y_ptr + static_cast<int64_t>(row) * 4 * kHiddenDim + i * kHiddenDim + col);
       }
       auto in = to<float>(values);
       auto* i2 = reinterpret_cast<const float2*>(&in[0]);
 #pragma unroll
-      for (int j = 0; j < E / 2; ++j)
-        o2[j] = ihc_fma2(make_float2(gates[i], gates[i]), i2[j], o2[j]);
+      for (int j = 0; j < kElementsPerThread / 2; ++j)
+        o2[j] = ihc_fma2(make_float2(smem_pre_gates[i], smem_pre_gates[i]), i2[j], o2[j]);
     }
-    if constexpr (Norm) {
-      if constexpr (Cast) {
+    if constexpr (kFuseRmsNorm) {
+      if constexpr (kCastBfloatForNorm) {
         saved[ch] = to<__nv_bfloat16>(out);
         out = to<float>(saved[ch]);
       } else {
         saved[ch] = out;
       }
 #pragma unroll
-      for (int j = 0; j < E; ++j) osq += out[j] * out[j];
+      for (int j = 0; j < kElementsPerThread; ++j) output_sqsum += out[j] * out[j];
     } else {
-      store(z + static_cast<int64_t>(row) * D + (ch * T + tid) * E, to<__nv_bfloat16>(out));
+      store(z_ptr + static_cast<int64_t>(row) * kHiddenDim +
+                (ch * kThreadsPerBlock + tid) * kElementsPerThread,
+            to<__nv_bfloat16>(out));
     }
   }
-  if constexpr (Norm) {
-    float ss = warp_reduce_sum_xor(osq);
-    if (lane == 0) norm[warp] = ss;
+  if constexpr (kFuseRmsNorm) {
+    float ss = warp_reduce_sum_xor(output_sqsum);
+    if (lane == 0) smem_norm_partial[warp] = ss;
     __syncthreads();
     if (tid == 0) {
       float total = 0;
-      for (int k = 0; k < Warps; ++k) total += norm[k];
-      rn = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+      for (int k = 0; k < kWarpsPerBlock; ++k) total += smem_norm_partial[k];
+      smem_rms_inv = rsqrtf_ftz(total * (1.f / kHiddenDim) + rms_eps);
     }
     __syncthreads();
 #pragma unroll
-    for (int ch = 0; ch < C; ++ch) {
-      int col = (ch * T + tid) * E;
-      auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+    for (int ch = 0; ch < kChunksPerRow; ++ch) {
+      int col = (ch * kThreadsPerBlock + tid) * kElementsPerThread;
+      auto g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + col));
       auto out = to<float>(saved[ch]);
       auto* o2 = reinterpret_cast<float2*>(&out[0]);
       auto* g2 = reinterpret_cast<const float2*>(&g[0]);
 #pragma unroll
-      for (int j = 0; j < E / 2; ++j) o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(rn, rn)), g2[j]);
-      store(z + static_cast<int64_t>(row) * D + col, to<__nv_bfloat16>(out));
+      for (int j = 0; j < kElementsPerThread / 2; ++j)
+        o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(smem_rms_inv, smem_rms_inv)), g2[j]);
+      store(z_ptr + static_cast<int64_t>(row) * kHiddenDim + col, to<__nv_bfloat16>(out));
     }
   }
-  if constexpr (PDL) cudaTriggerProgrammaticLaunchCompletion();
+  if constexpr (kUsePDL) cudaTriggerProgrammaticLaunchCompletion();
 }
 
-template <int D, int Rows, int Threads, int EpilogueThreads, bool FuseNorm, bool CastBfloat,
-          bool UsePDL = false, bool Aligned32 = false>
+template <int kHiddenDim, int kRowsPerBlock, int kThreadsPerBlock, int kEpilogueThreadsPerRow,
+          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kUsePDL = false,
+          bool kWeightsAligned32 = false>
 __device__ __forceinline__ void ihc_post_pre_rows_device(
-    __nv_bfloat16* y, __nv_bfloat16* z, float* h_out, const __nv_bfloat16* xa,
-    const __nv_bfloat16* residual, const float* h_in, const float* w, const float* hc_scale,
-    const float* hc_base, int m, float norm_eps, float hc_eps, float magnitude,
-    const __nv_bfloat16* gamma, float rms_eps) {
-  constexpr int HC = 4;
-  constexpr int Proj = 8;
-  constexpr int E = 8;
-  constexpr int Warps = Threads / 32;
-  constexpr int Chunks = D / (Threads * E);
+    __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
+    const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
+    const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch, float norm_eps,
+    float hc_eps, float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
+  constexpr int kHCMult = 4;
+  constexpr int kProjRows = 8;
+  constexpr int kElementsPerThread = 8;
+  constexpr int kWarpsPerBlock = kThreadsPerBlock / 32;
+  constexpr int kChunksPerRow = kHiddenDim / (kThreadsPerBlock * kElementsPerThread);
   constexpr bool kSm90 = HPC_TARGET_ARCH == 90;
-  constexpr bool kSingleRow = kSm90 && Rows == 1;
-  static_assert(D % (Threads * E) == 0, "block span must divide hidden size");
-  if constexpr (UsePDL) {
+  constexpr bool kSingleRow = kSm90 && kRowsPerBlock == 1;
+  static_assert(kHiddenDim % (kThreadsPerBlock * kElementsPerThread) == 0,
+                "block span must divide hidden size");
+  if constexpr (kUsePDL) {
     cudaGridDependencySynchronize();
   }
-  const int row_base = blockIdx.x * Rows;
-  const int valid_rows = kSingleRow ? 1 : min(Rows, m - row_base);
+  const int row_base = blockIdx.x * kRowsPerBlock;
+  const int valid_rows = kSingleRow ? 1 : min(kRowsPerBlock, num_batch - row_base);
   const int warp = threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
-  __shared__ float partial[Rows][Proj + 1][Warps];
-  __shared__ __align__(16) float h_pre[Rows][HC];
-  __shared__ float norm_partial[Rows * (EpilogueThreads / 32)];
-  float dot[Rows][Proj];
-  float sqsum[Rows];
+  __shared__ float smem_partial[kRowsPerBlock][kProjRows + 1][kWarpsPerBlock];
+  __shared__ __align__(16) float smem_pre_gates[kRowsPerBlock][kHCMult];
+  __shared__ float norm_partial[kRowsPerBlock * (kEpilogueThreadsPerRow / 32)];
+  float acc_dot[kRowsPerBlock][kProjRows];
+  float acc_sqsum[kRowsPerBlock];
 #pragma unroll
-  for (int r = 0; r < Rows; ++r) {
-    sqsum[r] = 0.f;
+  for (int r = 0; r < kRowsPerBlock; ++r) {
+    acc_sqsum[r] = 0.f;
 #pragma unroll
-    for (int c = 0; c < Proj; ++c) {
-      dot[r][c] = 0.f;
+    for (int c = 0; c < kProjRows; ++c) {
+      acc_dot[r][c] = 0.f;
     }
   }
 
 #pragma unroll 1
-  for (int ch = 0; ch < Chunks; ++ch) {
-    const int col = (ch * Threads + threadIdx.x) * E;
+  for (int ch = 0; ch < kChunksPerRow; ++ch) {
+    const int col = (ch * kThreadsPerBlock + threadIdx.x) * kElementsPerThread;
     // Keep xa packed while all four residual channels are processed.
-    vec_t<__nv_bfloat16, E> reg_xa[Rows];
+    vec_t<__nv_bfloat16, kElementsPerThread> reg_xa[kRowsPerBlock];
 #pragma unroll
-    for (int r = 0; r < Rows; ++r) {
+    for (int r = 0; r < kRowsPerBlock; ++r) {
       if (r < valid_rows) {
-        reg_xa[r] = load<__nv_bfloat16, E>(xa + static_cast<int64_t>(row_base + r) * D + col);
+        reg_xa[r] = load<__nv_bfloat16, kElementsPerThread>(
+            xa_ptr + static_cast<int64_t>(row_base + r) * kHiddenDim + col);
       }
     }
-#pragma unroll(kSingleRow ? HC : 1)
-    for (int i = 0; i < HC; ++i) {
-      const int flat = i * D + col;
-      vec_t<float, E> reg_y[Rows];
+#pragma unroll(kSingleRow ? kHCMult : 1)
+    for (int i = 0; i < kHCMult; ++i) {
+      const int flat = i * kHiddenDim + col;
+      vec_t<float, kElementsPerThread> reg_y[kRowsPerBlock];
 #pragma unroll
-      for (int r = 0; r < Rows; ++r) {
+      for (int r = 0; r < kRowsPerBlock; ++r) {
         if (r < valid_rows) {
           const int64_t row = row_base + r;
           const auto a = to<float>(reg_xa[r]);
-          const auto b = to<float>(load<__nv_bfloat16, E>(residual + row * HC * D + flat));
-          const float h = h_in[row * HC + i];
+          const auto b = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+              residual_ptr + row * kHCMult * kHiddenDim + flat));
+          const float h = H_post_in_ptr[row * kHCMult + i];
           const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
           const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
           auto* y2 = reinterpret_cast<float2*>(&reg_y[r][0]);
 #pragma unroll
-          for (int j = 0; j < E / 2; ++j) {
+          for (int j = 0; j < kElementsPerThread / 2; ++j) {
             y2[j] = ihc_fma2(make_float2(h, h), a2[j], b2[j]);
           }
           const auto bf = to<__nv_bfloat16>(reg_y[r]);
-          store(y + row * HC * D + flat, bf);
+          store(y_ptr + row * kHCMult * kHiddenDim + flat, bf);
           reg_y[r] = to<float>(bf);
 #pragma unroll
-          for (int j = 0; j < E; ++j) {
-            sqsum[r] += reg_y[r][j] * reg_y[r][j];
+          for (int j = 0; j < kElementsPerThread; ++j) {
+            acc_sqsum[r] += reg_y[r][j] * reg_y[r][j];
           }
         }
       }
 #pragma unroll
-      for (int c = 0; c < Proj; c += 2) {
-        vec_t<float, E> w0, w1;
-        const float* p0 = w + static_cast<int64_t>(c) * HC * D + flat;
-        const float* p1 = p0 + HC * D;
-        if constexpr (D != 4096) {
-          w0 = ihc_load_weight8<Aligned32>(p0);
-          w1 = ihc_load_weight8<Aligned32>(p1);
+      for (int c = 0; c < kProjRows; c += 2) {
+        vec_t<float, kElementsPerThread> w0, w1;
+        const float* p0 = w_ptr + static_cast<int64_t>(c) * kHCMult * kHiddenDim + flat;
+        const float* p1 = p0 + kHCMult * kHiddenDim;
+        if constexpr (kHiddenDim != 4096) {
+          w0 = ihc_load_weight8<kWeightsAligned32>(p0);
+          w1 = ihc_load_weight8<kWeightsAligned32>(p1);
         } else {
-          *reinterpret_cast<vec_t<float, E / 2>*>(&w0[0]) = load<float, E / 2>(p0);
-          *reinterpret_cast<vec_t<float, E / 2>*>(&w0[E / 2]) = load<float, E / 2>(p0 + E / 2);
-          *reinterpret_cast<vec_t<float, E / 2>*>(&w1[0]) = load<float, E / 2>(p1);
-          *reinterpret_cast<vec_t<float, E / 2>*>(&w1[E / 2]) = load<float, E / 2>(p1 + E / 2);
+          *reinterpret_cast<vec_t<float, kElementsPerThread / 2>*>(&w0[0]) =
+              load<float, kElementsPerThread / 2>(p0);
+          *reinterpret_cast<vec_t<float, kElementsPerThread / 2>*>(&w0[kElementsPerThread / 2]) =
+              load<float, kElementsPerThread / 2>(p0 + kElementsPerThread / 2);
+          *reinterpret_cast<vec_t<float, kElementsPerThread / 2>*>(&w1[0]) =
+              load<float, kElementsPerThread / 2>(p1);
+          *reinterpret_cast<vec_t<float, kElementsPerThread / 2>*>(&w1[kElementsPerThread / 2]) =
+              load<float, kElementsPerThread / 2>(p1 + kElementsPerThread / 2);
         }
 #pragma unroll
-        for (int r = 0; r < Rows; ++r) {
+        for (int r = 0; r < kRowsPerBlock; ++r) {
           if (r < valid_rows) {
-            ihc_dot_pair<E>(dot[r][c], dot[r][c + 1], reg_y[r], w0, w1);
+            ihc_dot_pair<kElementsPerThread>(acc_dot[r][c], acc_dot[r][c + 1], reg_y[r], w0, w1);
           }
         }
       }
@@ -541,59 +578,61 @@ __device__ __forceinline__ void ihc_post_pre_rows_device(
   }
 
 #pragma unroll
-  for (int r = 0; r < Rows; ++r) {
+  for (int r = 0; r < kRowsPerBlock; ++r) {
 #pragma unroll
-    for (int c = 0; c < Proj; ++c) {
-      const float v = warp_reduce_sum_xor(dot[r][c]);
+    for (int c = 0; c < kProjRows; ++c) {
+      const float v = warp_reduce_sum_xor(acc_dot[r][c]);
       if (lane == 0) {
-        partial[r][c][warp] = v;
+        smem_partial[r][c][warp] = v;
       }
     }
-    const float v = warp_reduce_sum_xor(sqsum[r]);
+    const float v = warp_reduce_sum_xor(acc_sqsum[r]);
     if (lane == 0) {
-      partial[r][Proj][warp] = v;
+      smem_partial[r][kProjRows][warp] = v;
     }
   }
   __syncthreads();
   if constexpr (!kSm90) {
-    for (int idx = threadIdx.x; idx < Rows * (Proj + 1); idx += Threads) {
-      const int r = idx / (Proj + 1);
-      const int c = idx % (Proj + 1);
+    for (int idx = threadIdx.x; idx < kRowsPerBlock * (kProjRows + 1); idx += kThreadsPerBlock) {
+      const int r = idx / (kProjRows + 1);
+      const int c = idx % (kProjRows + 1);
       float total = 0.f;
 #pragma unroll
-      for (int k = 0; k < Warps; ++k) {
-        total += partial[r][c][k];
+      for (int k = 0; k < kWarpsPerBlock; ++k) {
+        total += smem_partial[r][c][k];
       }
-      partial[r][c][0] = total;
+      smem_partial[r][c][0] = total;
     }
     __syncthreads();
   }
-  for (int idx = threadIdx.x; idx < valid_rows * HC; idx += Threads) {
-    const int r = idx / HC;
-    const int i = idx % HC;
+  for (int idx = threadIdx.x; idx < valid_rows * kHCMult; idx += kThreadsPerBlock) {
+    const int r = idx / kHCMult;
+    const int i = idx % kHCMult;
     float pre = 0.f, post = 0.f, sq = 0.f;
     if constexpr (kSm90) {
       // Reduce warp partials and compute the gates in the same threads.
 #pragma unroll
-      for (int k = 0; k < Warps; ++k) {
-        pre += partial[r][i][k];
-        post += partial[r][HC + i][k];
-        sq += partial[r][Proj][k];
+      for (int k = 0; k < kWarpsPerBlock; ++k) {
+        pre += smem_partial[r][i][k];
+        post += smem_partial[r][kHCMult + i][k];
+        sq += smem_partial[r][kProjRows][k];
       }
     } else {
-      pre = partial[r][i][0];
-      post = partial[r][HC + i][0];
-      sq = partial[r][Proj][0];
+      pre = smem_partial[r][i][0];
+      post = smem_partial[r][kHCMult + i][0];
+      sq = smem_partial[r][kProjRows][0];
     }
-    const float scale = rsqrtf_ftz(sq * (1.f / (HC * D)) + norm_eps);
-    h_pre[r][i] = sigmoid(hc_scale[0] * (pre * scale) + hc_base[i]) + hc_eps;
-    h_out[(row_base + r) * HC + i] =
-        magnitude * sigmoid(hc_scale[1] * (post * scale) + hc_base[HC + i]) + hc_eps;
+    const float scale = rsqrtf_ftz(sq * (1.f / (kHCMult * kHiddenDim)) + norm_eps);
+    smem_pre_gates[r][i] = sigmoid(hc_scale_ptr[0] * (pre * scale) + hc_base_ptr[i]) + hc_eps;
+    H_post_out_ptr[(row_base + r) * kHCMult + i] =
+        magnitude * sigmoid(hc_scale_ptr[1] * (post * scale) + hc_base_ptr[kHCMult + i]) + hc_eps;
   }
   __syncthreads();
-  ihc_mix_epilogue<HC, D, E, Rows, Threads, EpilogueThreads, FuseNorm, CastBfloat>(
-      z, y, &h_pre[0][0], row_base, valid_rows, gamma, rms_eps, norm_partial);
-  if constexpr (UsePDL) {
+  ihc_mix_epilogue<kHCMult, kHiddenDim, kElementsPerThread, kRowsPerBlock, kThreadsPerBlock,
+                   kEpilogueThreadsPerRow, kFuseRmsNorm, kCastBfloatForNorm>(
+      z_ptr, y_ptr, &smem_pre_gates[0][0], row_base, valid_rows, rms_weight_ptr, rms_eps,
+      norm_partial);
+  if constexpr (kUsePDL) {
     cudaTriggerProgrammaticLaunchCompletion();
   }
 }
@@ -878,42 +917,44 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }
 
 #if HPC_TARGET_ARCH == 90
-enum class PostPrePath { Rows, Retained, Cluster, ReloadResidual };
+enum class PostPrePath { Rows, Retained, Cluster, ReloadPostOutput };
 
-template <int kHiddenDim, int kThreads, PostPrePath kPath, int kRows, int kClusterBlocks,
-          int kMinBlocksPerSm, bool kUsePDL, bool kFuseRmsNorm, bool kCastBfloatForNorm>
-__global__ void __launch_bounds__(kThreads, kMinBlocksPerSm)
-    fuse_ihc_post_pre_sm90_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* h_post_out,
-                                  const __nv_bfloat16* xa, const __nv_bfloat16* residual,
-                                  const float* h_post_in, const float* w, const float* hc_scale,
-                                  const float* hc_base, int num_batch, float norm_eps, float hc_eps,
-                                  float magnitude, const __nv_bfloat16* rms_weight, float rms_eps) {
+template <int kHiddenDim, int kThreadsPerBlock, PostPrePath kPath, int kRowsPerBlock,
+          int kClusterBlocks, int kMinBlocksPerSm, bool kUsePDL, bool kFuseRmsNorm,
+          bool kCastBfloatForNorm>
+__global__ void __launch_bounds__(kThreadsPerBlock, kMinBlocksPerSm)
+    fuse_ihc_post_pre_sm90_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
+                                  const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
+                                  const float* H_post_in_ptr, const float* w_ptr,
+                                  const float* hc_scale_ptr, const float* hc_base_ptr,
+                                  int num_batch, float norm_eps, float hc_eps, float magnitude,
+                                  const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   if constexpr (kPath == PostPrePath::Cluster) {
     ihc_post_pre_cluster_device<kHiddenDim, kClusterBlocks, kFuseRmsNorm, kCastBfloatForNorm,
-                                kUsePDL>(y, z, h_post_out, xa, residual, h_post_in, w, hc_scale,
-                                         hc_base, num_batch, norm_eps, hc_eps, magnitude,
-                                         rms_weight, rms_eps);
-  } else if constexpr (kPath == PostPrePath::Retained || kPath == PostPrePath::ReloadResidual) {
-    constexpr bool kRetainResidual = kPath == PostPrePath::Retained;
-    ihc_post_pre_single_row_device<kHiddenDim, kThreads, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
-                                   false, false, kRetainResidual>(
-        y, z, h_post_out, xa, residual, h_post_in, w, hc_scale, hc_base, num_batch, norm_eps,
-        hc_eps, magnitude, rms_weight, rms_eps);
+                                kUsePDL>(y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
+                                         H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
+                                         norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+  } else if constexpr (kPath == PostPrePath::Retained || kPath == PostPrePath::ReloadPostOutput) {
+    constexpr bool kRetainPostOutput = kPath == PostPrePath::Retained;
+    ihc_post_pre_single_row_device<kHiddenDim, kThreadsPerBlock, kFuseRmsNorm, kCastBfloatForNorm,
+                                   kUsePDL, false, false, kRetainPostOutput>(
+        y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+        hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
   } else {
-    ihc_post_pre_rows_device<kHiddenDim, kRows, kThreads, kThreads, kFuseRmsNorm,
-                             kCastBfloatForNorm, kUsePDL>(y, z, h_post_out, xa, residual, h_post_in,
-                                                          w, hc_scale, hc_base, num_batch, norm_eps,
-                                                          hc_eps, magnitude, rms_weight, rms_eps);
+    ihc_post_pre_rows_device<kHiddenDim, kRowsPerBlock, kThreadsPerBlock, kThreadsPerBlock,
+                             kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
+        y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+        hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
   }
 }
 #else
 // One global entry completes post, pre and optional RMSNorm. M is uniform across
 // the grid; each branch calls an inline device helper with its own fixed layout.
 // Rows path for SM90 (always) and non-SM90 (3072/4096 rows; 6144 large-batch rows-2).
-// kRows selects how many rows per block; __launch_bounds__ matches the actual block size.
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kRows,
-          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
-          bool kWeightsAligned = true>
+// kRowsPerBlock selects how many rows per block; __launch_bounds__ matches the actual block size.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
+          int kRowsPerBlock, bool kUsePDL = false, bool kFuseRmsNorm = false,
+          bool kCastBfloatForNorm = false, bool kWeightsAligned32 = true>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     fuse_ihc_post_pre_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
@@ -924,8 +965,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
   static_assert(kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144,
                 "supported hidden dimensions");
-  ihc_post_pre_rows_device<kHiddenDim, kRows, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
-                           kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
+  ihc_post_pre_rows_device<kHiddenDim, kRowsPerBlock, kThreadsPerBlock, kThreadsPerBlock,
+                           kFuseRmsNorm, kCastBfloatForNorm, kUsePDL, kWeightsAligned32>(
       y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
       hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
 }
@@ -957,7 +998,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 // Retained path for 6144 mid-batch: 768 threads per block, one block per row.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
           bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
-          bool kWeightsAligned = true>
+          bool kWeightsAligned32 = true>
 __global__ void __launch_bounds__(kThreadsPerBlock)
     fuse_ihc_post_pre_retained_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr,
                                       float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
@@ -969,7 +1010,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
                                       float rms_eps = 0.f) {
   static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
   ihc_post_pre_single_row_device<kHiddenDim, kThreadsPerBlock, kFuseRmsNorm, kCastBfloatForNorm,
-                                 kUsePDL, kWeightsAligned>(
+                                 kUsePDL, kWeightsAligned32>(
       y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
       hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
 }
@@ -983,14 +1024,16 @@ __device__ __forceinline__ void ihc_tmem_fence_after_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
-template <int BK, int Parts>
+template <int kBlockK, int kParts>
 struct IhcPostPreUmmaStorage {
-  using LA = decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
-                                          cute::Shape<cute::_64, cute::Int<BK>>{}));
-  using LB = decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
-                                          cute::Shape<cute::Int<8 * Parts>, cute::Int<BK>>{}));
-  __align__(1024) __nv_bfloat16 a[2][cute::cosize_v<LA>];
-  __align__(1024) __nv_bfloat16 b[2][cute::cosize_v<LB>];
+  using SmemLayoutA =
+      decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
+                                   cute::Shape<cute::_64, cute::Int<kBlockK>>{}));
+  using SmemLayoutB =
+      decltype(cute::tile_to_shape(cute::UMMA::Layout_K_SW128_Atom<cute::bfloat16_t>{},
+                                   cute::Shape<cute::Int<8 * kParts>, cute::Int<kBlockK>>{}));
+  __align__(1024) __nv_bfloat16 a[2][cute::cosize_v<SmemLayoutA>];
+  __align__(1024) __nv_bfloat16 b[2][cute::cosize_v<SmemLayoutB>];
   __align__(8) uint64_t barrier[2];
   uint32_t tmem;
   float sq[64];
@@ -1002,14 +1045,15 @@ struct IhcPostPreUmmaStorage {
 // M64 accumulators use half the TMEM datapaths. Interleave independent
 // accumulators across both halves to shorten the FP32 summation chains.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
-          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, int kAccumulatorGroups>
+          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned32,
+          int kAccumulatorGroups>
 __global__ void fuse_ihc_post_pre_umma_kernel(
     __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
     const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
     const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch, float norm_eps,
     float hc_eps, float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   static_assert((kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144) && kHCMult == 4 &&
-                    kElementsPerThread == 8 && kThreadsPerBlock == 256 && kWeightsAligned,
+                    kElementsPerThread == 8 && kThreadsPerBlock == 256 && kWeightsAligned32,
                 "supported UMMA layout");
   static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
   static_assert(kAccumulatorGroups == 8, "supported TMEM layout");
@@ -1019,8 +1063,8 @@ __global__ void fuse_ihc_post_pre_umma_kernel(
   constexpr int kRowsPerThread = 64 * kVecsPerTile / kThreadsPerBlock;
   constexpr int kTmemColumns = 128;
   using Storage = IhcPostPreUmmaStorage<kBlockK, kParts>;
-  using LA = typename Storage::LA;
-  using LB = typename Storage::LB;
+  using SmemLayoutA = typename Storage::SmemLayoutA;
+  using SmemLayoutB = typename Storage::SmemLayoutB;
   extern __shared__ __align__(1024) unsigned char storage[];
   auto& smem = *reinterpret_cast<Storage*>(storage);
   auto cluster = cooperative_groups::this_cluster();
@@ -1063,18 +1107,18 @@ __global__ void fuse_ihc_post_pre_umma_kernel(
                                     cute::make_shape(cute::Int<64>{}, cute::Int<8 * kParts>{}),
                                     cute::make_stride(cute::Int<8 * kParts>{}, cute::Int<1>{})))
                                 .layout();
-  // Per-slot smem tensorsmem. The full LA/LB layouts apply the Swizzle<3,4,3> permutation at
+  // The per-slot shared-memory layouts apply the Swizzle<3,4,3> permutation at
   // coordinate access, so the store sites need no hand-written swizzle arithmetic.
   // Each slot gets its own tensor and the slot branch is hoisted out of the element loops
   // below, keeping every branch statically resolvable.
-  auto sA0 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[0])), LA{});
-  auto sA1 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[1])), LA{});
-  auto sB0 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[0])), LB{});
-  auto sB1 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[1])), LB{});
+  auto sA0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[0])),
+                               SmemLayoutA{});
+  auto sA1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[1])),
+                               SmemLayoutA{});
+  auto sB0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[0])),
+                               SmemLayoutB{});
+  auto sB1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[1])),
+                               SmemLayoutB{});
   // TMEM addressing for the kAccumulatorGroups=8, kParts=3 accumulator layout.
   constexpr uint32_t kTmemAccWidth = 8 * kParts;       // columns per accumulator group
   constexpr uint32_t kTmemPartitionStride = 1u << 20;  // high/low 32K partition selector
@@ -1331,190 +1375,198 @@ __device__ __forceinline__ void ihc_three_wg_barrier() {
   asm volatile("barrier.sync %0, %1;" ::"n"(kBarrierId), "n"(kParticipants) : "memory");
 }
 
-struct IhcPostPreThreeWarpGroups {};
-
-template <int D>
-struct IhcPostPreThreeWarpStorage {
-  __align__(16) __nv_bfloat16 y[1][4][D];
-  float part[1][9][4];
-  float gates[1][4];
-  float norm[1][4];
-  float rn[1];
+template <int kHiddenDim>
+struct IhcPostPreThreeWarpGroupStorage {
+  __align__(16) __nv_bfloat16 post_output[1][4][kHiddenDim];
+  float partial[1][9][4];
+  float pre_gates[1][4];
+  float norm_partial[1][4];
 };
 
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
-          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, typename Layout>
+          bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned32>
 __global__ void __launch_bounds__(kThreadsPerBlock, kHiddenDim == 6144 ? 1 : 2)
-    fuse_ihc_post_pre_three_wg_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp,
-                                      const __nv_bfloat16* xa, const __nv_bfloat16* res,
-                                      const float* hi, const float* w, const float* scale,
-                                      const float* bias, int m, float norm_eps, float hc_eps,
-                                      float magnitude, const __nv_bfloat16* gamma, float rms_eps) {
-  static_assert(std::is_same_v<Layout, IhcPostPreThreeWarpGroups>, "supported warp layout");
+    fuse_ihc_post_pre_three_wg_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr,
+                                      float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
+                                      const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr,
+                                      const float* w_ptr, const float* hc_scale_ptr,
+                                      const float* hc_base_ptr, int num_batch, float norm_eps,
+                                      float hc_eps, float magnitude,
+                                      const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   static_assert(
-      kHCMult == 4 && kElementsPerThread == 8 && kThreadsPerBlock == 384 && kWeightsAligned,
+      kHCMult == 4 && kElementsPerThread == 8 && kThreadsPerBlock == 384 && kWeightsAligned32,
       "supported three-warp-group layout");
   static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
   if constexpr (kHiddenDim == 6144 || kHiddenDim == 3072) {
     ihc_post_pre_single_row_device<kHiddenDim, kThreadsPerBlock, kFuseRmsNorm, kCastBfloatForNorm,
-                                   kUsePDL, kWeightsAligned, true>(
-        y, z, hp, xa, res, hi, w, scale, bias, m, norm_eps, hc_eps, magnitude, gamma, rms_eps);
+                                   kUsePDL, kWeightsAligned32, true>(
+        y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+        hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
   } else {
     static_assert(kHiddenDim == 4096, "supported hidden dimension");
-    constexpr int D = kHiddenDim, Rows = 1;
-    constexpr bool Norm = kFuseRmsNorm;
-    constexpr int T = 128, E = 8, C = D / (T * E);
+    constexpr int kRowsPerBlock = 1;
+    constexpr int kThreadsPerWarpGroup = 128,
+                  kChunksPerRow = kHiddenDim / (kThreadsPerWarpGroup * kElementsPerThread);
     extern __shared__ __align__(16) unsigned char three_warp_storage[];
-    auto& s = *reinterpret_cast<IhcPostPreThreeWarpStorage<D>*>(three_warp_storage);
-    const int wg = threadIdx.x / T, tid = threadIdx.x % T;
+    auto& smem =
+        *reinterpret_cast<IhcPostPreThreeWarpGroupStorage<kHiddenDim>*>(three_warp_storage);
+    const int wg = threadIdx.x / kThreadsPerWarpGroup, tid = threadIdx.x % kThreadsPerWarpGroup;
     const int lane = tid % 32, warp = tid / 32;
-    const int base = blockIdx.x * Rows;
-    const int valid = min(Rows, m - base);
+    const int base = blockIdx.x * kRowsPerBlock;
+    const int valid = min(kRowsPerBlock, num_batch - base);
     if constexpr (kUsePDL) cudaGridDependencySynchronize();
     if (wg == 0) {
-      float sq[Rows] = {};
+      float sq[kRowsPerBlock] = {};
 #pragma unroll 1
-      for (int ch = 0; ch < C; ++ch) {
-        const int col = (ch * T + tid) * E;
-        vec_t<float, E> a[Rows];
+      for (int ch = 0; ch < kChunksPerRow; ++ch) {
+        const int col = (ch * kThreadsPerWarpGroup + tid) * kElementsPerThread;
+        vec_t<float, kElementsPerThread> a[kRowsPerBlock];
 #pragma unroll
-        for (int r = 0; r < Rows; ++r) {
-          if (r < valid) a[r] = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + r) * D + col));
+        for (int r = 0; r < kRowsPerBlock; ++r) {
+          if (r < valid)
+            a[r] = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+                xa_ptr + int64_t(base + r) * kHiddenDim + col));
         }
 #pragma unroll 1
         for (int c = 0; c < 4; ++c) {
 #pragma unroll
-          for (int r = 0; r < Rows; ++r) {
+          for (int r = 0; r < kRowsPerBlock; ++r) {
             if (r < valid) {
-              const int64_t flat = int64_t(base + r) * 4 * D + c * D + col;
-              const auto b = to<float>(load<__nv_bfloat16, E>(res + flat));
-              const float h = hi[(base + r) * 4 + c];
-              vec_t<float, E> v;
+              const int64_t flat = int64_t(base + r) * 4 * kHiddenDim + c * kHiddenDim + col;
+              const auto b =
+                  to<float>(load<__nv_bfloat16, kElementsPerThread>(residual_ptr + flat));
+              const float h = H_post_in_ptr[(base + r) * 4 + c];
+              vec_t<float, kElementsPerThread> v;
               auto* v2 = reinterpret_cast<float2*>(&v[0]);
               const auto* a2 = reinterpret_cast<const float2*>(&a[r][0]);
               const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
 #pragma unroll
-              for (int j = 0; j < E / 2; ++j) v2[j] = ihc_fma2(make_float2(h, h), a2[j], b2[j]);
+              for (int j = 0; j < kElementsPerThread / 2; ++j)
+                v2[j] = ihc_fma2(make_float2(h, h), a2[j], b2[j]);
               const auto bf = to<__nv_bfloat16>(v);
-              store(y + flat, bf);
-              store(&s.y[r][c][col], bf);
+              store(y_ptr + flat, bf);
+              store(&smem.post_output[r][c][col], bf);
               const auto rounded = to<float>(bf);
 #pragma unroll
-              for (int j = 0; j < E; ++j) sq[r] += rounded[j] * rounded[j];
+              for (int j = 0; j < kElementsPerThread; ++j) sq[r] += rounded[j] * rounded[j];
             }
           }
         }
         ihc_three_wg_barrier();
       }
 #pragma unroll
-      for (int r = 0; r < Rows; ++r) {
+      for (int r = 0; r < kRowsPerBlock; ++r) {
         const float sum = warp_reduce_sum_xor(sq[r]);
-        if (lane == 0) s.part[r][8][warp] = sum;
+        if (lane == 0) smem.partial[r][8][warp] = sum;
       }
     } else {
-      float dot[Rows][4] = {};
+      float acc_dot[kRowsPerBlock][4] = {};
 #pragma unroll 1
-      for (int ch = 0; ch < C; ++ch) {
-        const int col = (ch * T + tid) * E;
+      for (int ch = 0; ch < kChunksPerRow; ++ch) {
+        const int col = (ch * kThreadsPerWarpGroup + tid) * kElementsPerThread;
         ihc_three_wg_barrier();
 #pragma unroll 1
         for (int c = 0; c < 4; ++c) {
-          vec_t<float, E> v[Rows];
+          vec_t<float, kElementsPerThread> v[kRowsPerBlock];
 #pragma unroll
-          for (int r = 0; r < Rows; ++r)
-            if (r < valid) v[r] = to<float>(load<__nv_bfloat16, E>(&s.y[r][c][col]));
+          for (int r = 0; r < kRowsPerBlock; ++r)
+            if (r < valid)
+              v[r] =
+                  to<float>(load<__nv_bfloat16, kElementsPerThread>(&smem.post_output[r][c][col]));
 #pragma unroll
           for (int p = 0; p < 4; ++p) {
             const int proj = (wg - 1) * 4 + p;
-            const float* wp = w + int64_t(proj) * 4 * D + c * D + col;
+            const float* wp = w_ptr + int64_t(proj) * 4 * kHiddenDim + c * kHiddenDim + col;
             const auto weights = ihc_load_weight8<true>(wp);
 #pragma unroll
-            for (int r = 0; r < Rows; ++r) {
+            for (int r = 0; r < kRowsPerBlock; ++r) {
               if (r < valid) {
 #pragma unroll
-                for (int j = 0; j < E; ++j) dot[r][p] += v[r][j] * weights[j];
+                for (int j = 0; j < kElementsPerThread; ++j) acc_dot[r][p] += v[r][j] * weights[j];
               }
             }
           }
         }
       }
 #pragma unroll
-      for (int r = 0; r < Rows; ++r) {
+      for (int r = 0; r < kRowsPerBlock; ++r) {
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
-          const float sum = warp_reduce_sum_xor(dot[r][p]);
-          if (lane == 0) s.part[r][(wg - 1) * 4 + p][warp] = sum;
+          const float sum = warp_reduce_sum_xor(acc_dot[r][p]);
+          if (lane == 0) smem.partial[r][(wg - 1) * 4 + p][warp] = sum;
         }
       }
     }
     __syncthreads();
-    if (threadIdx.x < Rows * 4) {
+    if (threadIdx.x < kRowsPerBlock * 4) {
       const int r = threadIdx.x / 4, i = threadIdx.x % 4;
       if (r < valid) {
         float pre = 0, post = 0, sq = 0;
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-          pre += s.part[r][i][k];
-          post += s.part[r][i + 4][k];
-          sq += s.part[r][8][k];
+          pre += smem.partial[r][i][k];
+          post += smem.partial[r][i + 4][k];
+          sq += smem.partial[r][8][k];
         }
-        const float inv = rsqrtf_ftz(sq * (1.f / (4 * D)) + norm_eps);
-        s.gates[r][i] = sigmoid(scale[0] * (pre * inv) + bias[i]) + hc_eps;
-        hp[(base + r) * 4 + i] =
-            magnitude * sigmoid(scale[1] * (post * inv) + bias[i + 4]) + hc_eps;
+        const float inv = rsqrtf_ftz(sq * (1.f / (4 * kHiddenDim)) + norm_eps);
+        smem.pre_gates[r][i] = sigmoid(hc_scale_ptr[0] * (pre * inv) + hc_base_ptr[i]) + hc_eps;
+        H_post_out_ptr[(base + r) * 4 + i] =
+            magnitude * sigmoid(hc_scale_ptr[1] * (post * inv) + hc_base_ptr[i + 4]) + hc_eps;
       }
     }
     __syncthreads();
 #pragma unroll 1
-    for (int wave = 0; wave < (Rows + 2) / 3; ++wave) {
+    for (int wave = 0; wave < (kRowsPerBlock + 2) / 3; ++wave) {
       const int r = wave * 3 + wg;
       const bool active = r < valid;
-      vec_t<__nv_bfloat16, E> saved[C];
+      vec_t<__nv_bfloat16, kElementsPerThread> saved[kChunksPerRow];
       float sq = 0;
       if (active) {
 #pragma unroll
-        for (int ch = 0; ch < C; ++ch) {
-          const int col = (ch * T + tid) * E;
-          vec_t<float, E> out = {};
+        for (int ch = 0; ch < kChunksPerRow; ++ch) {
+          const int col = (ch * kThreadsPerWarpGroup + tid) * kElementsPerThread;
+          vec_t<float, kElementsPerThread> out = {};
 #pragma unroll
           for (int c = 0; c < 4; ++c) {
-            const auto v = to<float>(load<__nv_bfloat16, E>(&s.y[r][c][col]));
+            const auto v =
+                to<float>(load<__nv_bfloat16, kElementsPerThread>(&smem.post_output[r][c][col]));
             auto* o2 = reinterpret_cast<float2*>(&out[0]);
             const auto* v2 = reinterpret_cast<const float2*>(&v[0]);
 #pragma unroll
-            for (int j = 0; j < E / 2; ++j)
-              o2[j] = ihc_fma2(make_float2(s.gates[r][c], s.gates[r][c]), v2[j], o2[j]);
+            for (int j = 0; j < kElementsPerThread / 2; ++j)
+              o2[j] =
+                  ihc_fma2(make_float2(smem.pre_gates[r][c], smem.pre_gates[r][c]), v2[j], o2[j]);
           }
           saved[ch] = to<__nv_bfloat16>(out);
-          if constexpr (Norm) {
+          if constexpr (kFuseRmsNorm) {
             out = to<float>(saved[ch]);
 #pragma unroll
-            for (int j = 0; j < E; ++j) sq += out[j] * out[j];
+            for (int j = 0; j < kElementsPerThread; ++j) sq += out[j] * out[j];
           } else {
-            store(z + int64_t(base + r) * D + col, saved[ch]);
+            store(z_ptr + int64_t(base + r) * kHiddenDim + col, saved[ch]);
           }
         }
       }
-      if constexpr (Norm) {
+      if constexpr (kFuseRmsNorm) {
         const float sum = warp_reduce_sum_xor(sq);
-        if (lane == 0 && r < Rows) s.norm[r][warp] = sum;
+        if (lane == 0 && r < kRowsPerBlock) smem.norm_partial[r][warp] = sum;
         __syncthreads();
         if (active) {
           float total = 0;
 #pragma unroll
-          for (int k = 0; k < 4; ++k) total += s.norm[r][k];
-          const float inv = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+          for (int k = 0; k < 4; ++k) total += smem.norm_partial[r][k];
+          const float inv = rsqrtf_ftz(total * (1.f / kHiddenDim) + rms_eps);
 #pragma unroll
-          for (int ch = 0; ch < C; ++ch) {
-            const int col = (ch * T + tid) * E;
-            const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+          for (int ch = 0; ch < kChunksPerRow; ++ch) {
+            const int col = (ch * kThreadsPerWarpGroup + tid) * kElementsPerThread;
+            const auto g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + col));
             auto out = to<float>(saved[ch]);
             auto* o2 = reinterpret_cast<float2*>(&out[0]);
             const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
 #pragma unroll
-            for (int j = 0; j < E / 2; ++j)
+            for (int j = 0; j < kElementsPerThread / 2; ++j)
               o2[j] = ihc_mul2(ihc_mul2(o2[j], make_float2(inv, inv)), g2[j]);
-            store(z + int64_t(base + r) * D + col, to<__nv_bfloat16>(out));
+            store(z_ptr + int64_t(base + r) * kHiddenDim + col, to<__nv_bfloat16>(out));
           }
         }
       }
@@ -1900,10 +1952,12 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                      const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   constexpr int kThreads = kHiddenDim == 3072 ? 192 : 256;
 #if HPC_TARGET_ARCH != 90
-  const bool weights_aligned = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
+  constexpr int k6144NonClusterBatchMin = 80;
+  constexpr int kRows2BatchMin = 297;
+  const bool weights_aligned32 = (reinterpret_cast<uintptr_t>(w_ptr) & 31) == 0;
   if constexpr (kUsePDL && (!kFuseRmsNorm || kCastBfloatForNorm)) {
     constexpr int kUmmaMin = kHiddenDim == 3072 ? 8960 : 8192;
-    if (num_batch >= kUmmaMin && weights_aligned) {
+    if (num_batch >= kUmmaMin && weights_aligned32) {
       constexpr int kUmmaThreads = 256;
       constexpr int kUmmaBlocks = kernels::ihc_post_pre_num_blocks(kHiddenDim);
       auto kernel =
@@ -1932,36 +1986,38 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                 num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     }
     if constexpr (kHiddenDim != 4096 || !kFuseRmsNorm) {
-      constexpr int kThreeWarpMin = kHiddenDim == 6144   ? 80
-                                    : kHiddenDim == 3072 ? (kFuseRmsNorm ? 48 : 72)
-                                                         : 149;
-      const int three_warp_max = kHiddenDim == 3072 ? 4 * get_sm_count() : 296;
-      if (num_batch >= kThreeWarpMin && num_batch <= three_warp_max && weights_aligned) {
-        constexpr int kThreeWarpThreads = 384;
+      constexpr int kThreeWarpGroupMin = kHiddenDim == 6144   ? k6144NonClusterBatchMin
+                                         : kHiddenDim == 3072 ? (kFuseRmsNorm ? 48 : 72)
+                                                              : 149;
+      const int three_warp_group_max = kHiddenDim == 3072 ? 4 * get_sm_count() : kRows2BatchMin - 1;
+      if (num_batch >= kThreeWarpGroupMin && num_batch <= three_warp_group_max &&
+          weights_aligned32) {
+        constexpr int kThreeWarpGroupThreads = 384;
         auto kernel =
-            kernels::fuse_ihc_post_pre_three_wg_kernel<4, kHiddenDim, 8, kThreeWarpThreads, kUsePDL,
-                                                       kFuseRmsNorm, kCastBfloatForNorm, true,
-                                                       kernels::IhcPostPreThreeWarpGroups>;
+            kernels::fuse_ihc_post_pre_three_wg_kernel<4, kHiddenDim, 8, kThreeWarpGroupThreads,
+                                                       kUsePDL, kFuseRmsNorm, kCastBfloatForNorm,
+                                                       true>;
         constexpr size_t kShared =
-            kHiddenDim == 4096 ? sizeof(kernels::IhcPostPreThreeWarpStorage<4096>) : 0;
+            kHiddenDim == 4096 ? sizeof(kernels::IhcPostPreThreeWarpGroupStorage<4096>) : 0;
         if constexpr (kShared > 0) {
           const cudaError_t setup =
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kShared);
           if (setup != cudaSuccess) return setup;
         }
-        cudaLaunchConfig_t three_warp_config{};
-        three_warp_config.gridDim = dim3(num_batch);
-        three_warp_config.blockDim = dim3(kThreeWarpThreads);
-        three_warp_config.dynamicSmemBytes = kShared;
-        three_warp_config.stream = stream;
+        cudaLaunchConfig_t three_warp_group_config{};
+        three_warp_group_config.gridDim = dim3(num_batch);
+        three_warp_group_config.blockDim = dim3(kThreeWarpGroupThreads);
+        three_warp_group_config.dynamicSmemBytes = kShared;
+        three_warp_group_config.stream = stream;
         cudaLaunchAttribute attr{};
         attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attr.val.programmaticStreamSerializationAllowed = 1;
-        three_warp_config.attrs = &attr;
-        three_warp_config.numAttrs = 1;
-        return cudaLaunchKernelEx(&three_warp_config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
-                                  residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
-                                  num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+        three_warp_group_config.attrs = &attr;
+        three_warp_group_config.numAttrs = 1;
+        return cudaLaunchKernelEx(&three_warp_group_config, kernel, y_ptr, z_ptr, H_post_out_ptr,
+                                  xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+                                  hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude,
+                                  rms_weight_ptr, rms_eps);
       }
     }
   }
@@ -1980,9 +2036,9 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
   }
   using kernels::PostPrePath;
   // Zero leaves the minimum blocks per SM unspecified for ptxas.
-  auto launch = [&]<int kBlockThreads, PostPrePath kPath = PostPrePath::Rows, int kRows = 1,
+  auto launch = [&]<int kBlockThreads, PostPrePath kPath = PostPrePath::Rows, int kRowsPerBlock = 1,
                     int kClusterBlocks = 1, int kMinBlocksPerSm = 0>() {
-    config.gridDim = dim3(((num_batch + kRows - 1) / kRows) * kClusterBlocks);
+    config.gridDim = dim3(((num_batch + kRowsPerBlock - 1) / kRowsPerBlock) * kClusterBlocks);
     config.blockDim = dim3(kBlockThreads);
     if constexpr (kClusterBlocks > 1) {
       auto& attr = attrs[config.numAttrs++];
@@ -1991,9 +2047,10 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
       attr.val.clusterDim.y = 1;
       attr.val.clusterDim.z = 1;
     }
-    auto kernel = kernels::fuse_ihc_post_pre_sm90_kernel<kHiddenDim, kBlockThreads, kPath, kRows,
-                                                         kClusterBlocks, kMinBlocksPerSm, kUsePDL,
-                                                         kFuseRmsNorm, kCastBfloatForNorm>;
+    auto kernel =
+        kernels::fuse_ihc_post_pre_sm90_kernel<kHiddenDim, kBlockThreads, kPath, kRowsPerBlock,
+                                               kClusterBlocks, kMinBlocksPerSm, kUsePDL,
+                                               kFuseRmsNorm, kCastBfloatForNorm>;
     return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                               H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
                               hc_eps, magnitude, rms_weight_ptr, rms_eps);
@@ -2052,7 +2109,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     }
     if ((waves <= 6 && 2 * num_batch <= (2 * waves - 1) * sm_count) || waves == 7) {
       // Reread y with fewer registers so more CTAs can be resident.
-      return launch.template operator()<128, PostPrePath::ReloadResidual>();
+      return launch.template operator()<128, PostPrePath::ReloadPostOutput>();
     }
     if (waves <= 5) {
       return launch.template operator()<kThreads>();
@@ -2065,7 +2122,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
 #else
   // Each path has its own kernel with matching __launch_bounds__; dispatch here.
   if constexpr (kHiddenDim == 6144) {
-    if (num_batch < 80) {
+    if (num_batch < k6144NonClusterBatchMin) {
       // Cluster path: 8 blocks per cluster, 96 threads each.
       constexpr int kBlocks = kernels::ihc_post_pre_num_blocks(kHiddenDim);
       constexpr int kClusterThreads = kHiddenDim / (kBlocks * kElementsPerThread);
@@ -2081,7 +2138,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                 H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
                                 norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     }
-    if (num_batch <= 296) {
+    if (num_batch < kRows2BatchMin) {
       // Retained path: 768 threads per block, one block per row.
       constexpr int kRetainedThreads = kHiddenDim / kElementsPerThread;
       config.gridDim = dim3(num_batch);
@@ -2089,36 +2146,37 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
       auto& cattr = attrs[config.numAttrs++];
       cattr.id = cudaLaunchAttributeClusterDimension;
       cattr.val.clusterDim = {1, 1, 1};
-      auto launch = [&](auto aligned_tag) {
-        constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+      auto launch = [&](auto aligned32_tag) {
+        constexpr bool kWeightsAligned32 = decltype(aligned32_tag)::value;
         auto kernel =
             kernels::fuse_ihc_post_pre_retained_kernel<4, kHiddenDim, kElementsPerThread,
                                                        kRetainedThreads, kUsePDL, kFuseRmsNorm,
-                                                       kCastBfloatForNorm, kWeightsAligned>;
+                                                       kCastBfloatForNorm, kWeightsAligned32>;
         return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
                                   residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
                                   num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
       };
-      return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+      return weights_aligned32 ? launch(std::true_type{}) : launch(std::false_type{});
     }
     // Rows-2 path: 384 threads per block.
-    constexpr int kRows = 2;
+    constexpr int kRowsPerBlock = 2;
     constexpr int kRowsThreads = 384;
-    config.gridDim = dim3((num_batch + kRows - 1) / kRows);
+    config.gridDim = dim3((num_batch + kRowsPerBlock - 1) / kRowsPerBlock);
     config.blockDim = dim3(kRowsThreads);
     auto& cattr = attrs[config.numAttrs++];
     cattr.id = cudaLaunchAttributeClusterDimension;
     cattr.val.clusterDim = {1, 1, 1};
-    auto launch = [&](auto aligned_tag) {
-      constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
-      auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, kElementsPerThread,
-                                                      kRowsThreads, kRows, kUsePDL, kFuseRmsNorm,
-                                                      kCastBfloatForNorm, kWeightsAligned>;
+    auto launch = [&](auto aligned32_tag) {
+      constexpr bool kWeightsAligned32 = decltype(aligned32_tag)::value;
+      auto kernel =
+          kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, kElementsPerThread, kRowsThreads,
+                                            kRowsPerBlock, kUsePDL, kFuseRmsNorm,
+                                            kCastBfloatForNorm, kWeightsAligned32>;
       return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                                 H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
                                 norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     };
-    return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+    return weights_aligned32 ? launch(std::true_type{}) : launch(std::false_type{});
   } else {
     // 3072 / 4096: cluster path for small batch, rows path otherwise.
     static_assert(kHiddenDim == 4096 || kHiddenDim == 3072, "supported hidden dimensions");
@@ -2138,34 +2196,34 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
                                 H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
                                 norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     }
-    const int rows = num_batch >= 297 ? 2 : 1;
+    const int rows = num_batch >= kRows2BatchMin ? 2 : 1;
     config.gridDim = dim3((num_batch + rows - 1) / rows);
     config.blockDim = dim3(kThreads);
     auto& cattr = attrs[config.numAttrs++];
     cattr.id = cudaLaunchAttributeClusterDimension;
     cattr.val.clusterDim = {1, 1, 1};
     if (rows == 2) {
-      auto launch = [&](auto aligned_tag) {
-        constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+      auto launch = [&](auto aligned32_tag) {
+        constexpr bool kWeightsAligned32 = decltype(aligned32_tag)::value;
         auto kernel =
             kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, 2, kUsePDL, kFuseRmsNorm,
-                                              kCastBfloatForNorm, kWeightsAligned>;
+                                              kCastBfloatForNorm, kWeightsAligned32>;
         return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
                                   residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
                                   num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
       };
-      return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+      return weights_aligned32 ? launch(std::true_type{}) : launch(std::false_type{});
     }
-    auto launch = [&](auto aligned_tag) {
-      constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+    auto launch = [&](auto aligned32_tag) {
+      constexpr bool kWeightsAligned32 = decltype(aligned32_tag)::value;
       auto kernel =
           kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, 1, kUsePDL, kFuseRmsNorm,
-                                            kCastBfloatForNorm, kWeightsAligned>;
+                                            kCastBfloatForNorm, kWeightsAligned32>;
       return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                                 H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch,
                                 norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
     };
-    return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+    return weights_aligned32 ? launch(std::true_type{}) : launch(std::false_type{});
   }
 #endif
 }
