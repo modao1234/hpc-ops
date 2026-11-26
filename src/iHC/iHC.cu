@@ -1000,95 +1000,95 @@ struct IhcPostPreUmmaStorage {
 // accumulators across both halves to shorten the FP32 summation chains.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
           bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, int kAccumulatorGroups>
-__global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp,
-                                              const __nv_bfloat16* xa,
-                                              const __nv_bfloat16* residual, const float* hi,
-                                              const float* w, const float* scale, const float* bias,
-                                              int m, float norm_eps, float eps, float magnitude,
-                                              const __nv_bfloat16* gamma, float rms_eps) {
+__global__ void fuse_ihc_post_pre_umma_kernel(
+    __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr, const __nv_bfloat16* xa_ptr,
+    const __nv_bfloat16* residual_ptr, const float* H_post_in_ptr, const float* w_ptr,
+    const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch, float norm_eps,
+    float hc_eps, float magnitude, const __nv_bfloat16* rms_weight_ptr, float rms_eps) {
   static_assert((kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144) && kHCMult == 4 &&
                     kElementsPerThread == 8 && kThreadsPerBlock == 256 && kWeightsAligned,
                 "supported UMMA layout");
   static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
   static_assert(kAccumulatorGroups == 8, "supported TMEM layout");
-  constexpr int D = kHiddenDim, BK = 128, Parts = 3, Groups = kAccumulatorGroups;
-  constexpr int Blocks = ihc_post_pre_num_blocks(D);
-  constexpr bool Norm = kFuseRmsNorm;
-  constexpr int T = 256, E = 8, Vecs = BK / E, RowsPerThread = 64 * Vecs / T;
-  constexpr int Columns = 128;
-  using Storage = IhcPostPreUmmaStorage<BK, Parts>;
+  constexpr int kBlockK = 128, kParts = 3;
+  constexpr int kBlocks = ihc_post_pre_num_blocks(kHiddenDim);
+  constexpr int kVecsPerTile = kBlockK / kElementsPerThread;
+  constexpr int kRowsPerThread = 64 * kVecsPerTile / kThreadsPerBlock;
+  constexpr int kTmemColumns = 128;
+  using Storage = IhcPostPreUmmaStorage<kBlockK, kParts>;
   using LA = typename Storage::LA;
   using LB = typename Storage::LB;
   extern __shared__ __align__(1024) unsigned char storage[];
-  auto& s = *reinterpret_cast<Storage*>(storage);
+  auto& smem = *reinterpret_cast<Storage*>(storage);
   auto cluster = cooperative_groups::this_cluster();
   const int rank = cluster.block_rank();
-  constexpr int Slice = D / Blocks;
-  static_assert(Slice % BK == 0 && Slice % (32 * E) == 0, "slice must hold whole K tiles");
-  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, base = (blockIdx.x / Blocks) * 64;
-  const int valid = min(64, m - base);
+  constexpr int kSlice = kHiddenDim / kBlocks;
+  static_assert(kSlice % kBlockK == 0 && kSlice % (32 * kElementsPerThread) == 0,
+                "slice must hold whole K tiles");
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32, base = (blockIdx.x / kBlocks) * 64;
+  const int valid = min(64, num_batch - base);
   if constexpr (kUsePDL) cudaGridDependencySynchronize();
   if (tid < 32) {
     cute::TMEM::Allocator1Sm alloc;
-    alloc.allocate(Columns, &s.tmem);
+    alloc.allocate(kTmemColumns, &smem.tmem);
     alloc.release_allocation_lock();
     ihc_tmem_fence_before_sync();
   }
   if (tid == 0) {
-    cutlass::arch::ClusterBarrier::init(&s.barrier[0], 1);
-    cutlass::arch::ClusterBarrier::init(&s.barrier[1], 1);
+    cutlass::arch::ClusterBarrier::init(&smem.barrier[0], 1);
+    cutlass::arch::ClusterBarrier::init(&smem.barrier[1], 1);
   }
-  float sq[RowsPerThread] = {};
+  float sq[kRowsPerThread] = {};
   __syncthreads();
   ihc_tmem_fence_after_sync();
   using LDA = cute::ComposedLayout<
       cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
       cute::Layout<cute::Shape<cute::_64, cute::_64>, cute::Stride<cute::_64, cute::_1>>>;
   using LDB = cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
-                                   cute::Layout<cute::Shape<cute::Int<8 * Parts>, cute::_64>,
+                                   cute::Layout<cute::Shape<cute::Int<8 * kParts>, cute::_64>,
                                                 cute::Stride<cute::_64, cute::_1>>>;
   // TiledMma drives cute::gemm below; the UMMA descriptors are derived from the smem
   // tensor layouts instead of being assembled by hand.
   using TiledMma = decltype(cute::make_tiled_mma(
-      cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
+      cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * kParts,
                                  cute::UMMA::Major::K, cute::UMMA::Major::K>{}));
   TiledMma tiled_mma;
   auto thr_mma = tiled_mma.get_slice(0);  // 1SM: every warp sees the same slice
-  // Accumulator fragment layout for one 64 x (8 * Parts) TMEM tile.
+  // Accumulator fragment layout for one 64 x (8 * kParts) TMEM tile.
   const auto tAccr_layout = thr_mma
                                 .partition_fragment_C(cute::make_tensor(
                                     cute::make_gmem_ptr(static_cast<float*>(nullptr)),
-                                    cute::make_shape(cute::Int<64>{}, cute::Int<8 * Parts>{}),
-                                    cute::make_stride(cute::Int<8 * Parts>{}, cute::Int<1>{})))
+                                    cute::make_shape(cute::Int<64>{}, cute::Int<8 * kParts>{}),
+                                    cute::make_stride(cute::Int<8 * kParts>{}, cute::Int<1>{})))
                                 .layout();
-  // Per-slot smem tensors. The full LA/LB layouts apply the Swizzle<3,4,3> permutation at
+  // Per-slot smem tensorsmem. The full LA/LB layouts apply the Swizzle<3,4,3> permutation at
   // coordinate access, so the store sites need no hand-written swizzle arithmetic.
   // Each slot gets its own tensor and the slot branch is hoisted out of the element loops
   // below, keeping every branch statically resolvable.
   auto sA0 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LA{});
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[0])), LA{});
   auto sA1 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LA{});
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.a[1])), LA{});
   auto sB0 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LB{});
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[0])), LB{});
   auto sB1 =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LB{});
-  // TMEM addressing for the Groups=8, Parts=3 accumulator layout.
-  constexpr uint32_t kTmemAccWidth = 8 * Parts;        // columns per accumulator group
+      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(smem.b[1])), LB{});
+  // TMEM addressing for the kAccumulatorGroups=8, kParts=3 accumulator layout.
+  constexpr uint32_t kTmemAccWidth = 8 * kParts;       // columns per accumulator group
   constexpr uint32_t kTmemPartitionStride = 1u << 20;  // high/low 32K partition selector
   int phase[2] = {0, 0};
-  constexpr int TilesPerChannel = Slice / BK;
+  constexpr int kTilesPerChannel = kSlice / kBlockK;
   // Keep each XA tile hot while visiting all channels for D6144.
 #pragma unroll 1
-  for (int outer = 0; outer < (D == 6144 ? TilesPerChannel : 4); ++outer) {
+  for (int outer = 0; outer < (kHiddenDim == 6144 ? kTilesPerChannel : 4); ++outer) {
 #pragma unroll 1
-    for (int inner = 0; inner < (D == 6144 ? 4 : TilesPerChannel); ++inner) {
-      const int ch = D == 6144 ? inner : outer;
-      const int k0 = (D == 6144 ? outer : inner) * BK;
-      const int tile = D == 6144 ? outer * 4 + inner : outer * TilesPerChannel + inner;
+    for (int inner = 0; inner < (kHiddenDim == 6144 ? 4 : kTilesPerChannel); ++inner) {
+      const int ch = kHiddenDim == 6144 ? inner : outer;
+      const int k0 = (kHiddenDim == 6144 ? outer : inner) * kBlockK;
+      const int tile = kHiddenDim == 6144 ? outer * 4 + inner : outer * kTilesPerChannel + inner;
       const int slot = tile & 1;
       if (tile >= 2) {
-        if (tid < 32) cutlass::arch::ClusterBarrier::wait(&s.barrier[slot], phase[slot]);
+        if (tid < 32) cutlass::arch::ClusterBarrier::wait(&smem.barrier[slot], phase[slot]);
         phase[slot] ^= 1;
         __syncthreads();
       }
@@ -1097,40 +1097,43 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
       // exactly as the former hand-written form did.
       auto fill_smem = [&](auto& sA, auto& sB) {
 #pragma unroll
-        for (int j = 0; j < RowsPerThread; ++j) {
-          const int idx = j * T + tid, row = idx / Vecs, k = (idx % Vecs) * E,
-                    col = rank * Slice + k0 + k;
-          vec_t<__nv_bfloat16, E> bf{};
+        for (int j = 0; j < kRowsPerThread; ++j) {
+          const int idx = j * kThreadsPerBlock + tid, row = idx / kVecsPerTile,
+                    k = (idx % kVecsPerTile) * kElementsPerThread, col = rank * kSlice + k0 + k;
+          vec_t<__nv_bfloat16, kElementsPerThread> bf{};
           if (row < valid) {
-            const auto a = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + row) * D + col));
-            const auto b = to<float>(
-                load<__nv_bfloat16, E>(residual + int64_t(base + row) * 4 * D + ch * D + col));
-            const float h = hi[(base + row) * 4 + ch];
-            vec_t<float, E> v;
+            const auto a = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+                xa_ptr + int64_t(base + row) * kHiddenDim + col));
+            const auto b = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+                residual_ptr + int64_t(base + row) * 4 * kHiddenDim + ch * kHiddenDim + col));
+            const float h = H_post_in_ptr[(base + row) * 4 + ch];
+            vec_t<float, kElementsPerThread> v;
             auto* v2 = reinterpret_cast<float2*>(&v[0]);
             const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
             const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
 #pragma unroll
-            for (int q = 0; q < E / 2; ++q) v2[q] = ihc_fma2(make_float2(h, h), a2[q], b2[q]);
+            for (int q = 0; q < kElementsPerThread / 2; ++q)
+              v2[q] = ihc_fma2(make_float2(h, h), a2[q], b2[q]);
             bf = to<__nv_bfloat16>(v);
-            store(y + int64_t(base + row) * 4 * D + ch * D + col, bf);
+            store(y_ptr + int64_t(base + row) * 4 * kHiddenDim + ch * kHiddenDim + col, bf);
             v = to<float>(bf);
 #pragma unroll
-            for (int q = 0; q < E; ++q) sq[j] += v[q] * v[q];
+            for (int q = 0; q < kElementsPerThread; ++q) sq[j] += v[q] * v[q];
           }
           store(reinterpret_cast<__nv_bfloat16*>(&sA(row, k)), bf);
         }
-        // Preserve the FP32 weight residuals in separate BF16 projection terms.
-        for (int idx = tid; idx < 8 * Vecs; idx += T) {
-          const int p = idx / Vecs, k = (idx % Vecs) * E;
-          auto ww = ihc_load_weight8<true>(w + int64_t(p) * 4 * D + ch * D + rank * Slice + k0 + k);
+        // Preserve the FP32 weight residuals in separate BF16 projection termsmem.
+        for (int idx = tid; idx < 8 * kVecsPerTile; idx += kThreadsPerBlock) {
+          const int p = idx / kVecsPerTile, k = (idx % kVecsPerTile) * kElementsPerThread;
+          auto ww = ihc_load_weight8<true>(w_ptr + int64_t(p) * 4 * kHiddenDim + ch * kHiddenDim +
+                                           rank * kSlice + k0 + k);
 #pragma unroll
-          for (int part = 0; part < Parts; ++part) {
+          for (int part = 0; part < kParts; ++part) {
             const auto bf = to<__nv_bfloat16>(ww);
             store(reinterpret_cast<__nv_bfloat16*>(&sB(part * 8 + p, k)), bf);
             const auto rounded = to<float>(bf);
 #pragma unroll
-            for (int q = 0; q < E; ++q) ww[q] -= rounded[q];
+            for (int q = 0; q < kElementsPerThread; ++q) ww[q] -= rounded[q];
           }
         }
       };
@@ -1147,44 +1150,46 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
         auto tAs = thr_mma.make_fragment_A(thr_mma.partition_A(slot == 0 ? sA0 : sA1));
         auto tBs = thr_mma.make_fragment_B(thr_mma.partition_B(slot == 0 ? sB0 : sB1));
         auto tAccr = cute::make_tensor(
-            cute::make_tmem_ptr<float>(s.tmem + ((tile % Groups) / 2) * kTmemAccWidth +
-                                       ((tile % Groups) & 1) * kTmemPartitionStride),
+            cute::make_tmem_ptr<float>(smem.tmem +
+                                       ((tile % kAccumulatorGroups) / 2) * kTmemAccWidth +
+                                       ((tile % kAccumulatorGroups) & 1) * kTmemPartitionStride),
             tAccr_layout);
-        // The first Groups tiles seed their group; later tiles accumulate onto it.
+        // The first kAccumulatorGroups tiles seed their group; later tiles accumulate onto it.
         tiled_mma.accumulate_ =
-            tile < Groups ? cute::UMMA::ScaleOut::Zero : cute::UMMA::ScaleOut::One;
+            tile < kAccumulatorGroups ? cute::UMMA::ScaleOut::Zero : cute::UMMA::ScaleOut::One;
 #pragma unroll
         for (int ik = 0; ik < cute::size<2>(tAs); ++ik) {
           cute::gemm(tiled_mma, tAs(cute::_, cute::_, ik), tBs(cute::_, cute::_, ik), tAccr);
           tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
         }
-        cutlass::arch::umma_arrive(&s.barrier[slot]);
+        cutlass::arch::umma_arrive(&smem.barrier[slot]);
       }
       __syncthreads();
     }
   }
   if (tid < 32) {
     for (int slot = 0; slot < 2; ++slot)
-      cutlass::arch::ClusterBarrier::wait(&s.barrier[slot], phase[slot]);
+      cutlass::arch::ClusterBarrier::wait(&smem.barrier[slot], phase[slot]);
     ihc_tmem_fence_before_sync();
   }
   __syncthreads();
   ihc_tmem_fence_after_sync();
 #pragma unroll
-  for (int j = 0; j < RowsPerThread; ++j) {
-    constexpr int Width = Vecs < 32 ? Vecs : 32;
+  for (int j = 0; j < kRowsPerThread; ++j) {
+    constexpr int Width = kVecsPerTile < 32 ? kVecsPerTile : 32;
     float total = sq[j];
 #pragma unroll
     for (int mask = Width / 2; mask > 0; mask /= 2)
       total += __shfl_xor_sync(0xffffffff, total, mask);
-    if (tid % Vecs == 0) s.sq[(j * T + tid) / Vecs] = total;
-    if constexpr (Vecs > 32) {
-      if (tid % Vecs == 32) s.gate[(j * T + tid) / Vecs][0] = total;
+    if (tid % kVecsPerTile == 0) smem.sq[(j * kThreadsPerBlock + tid) / kVecsPerTile] = total;
+    if constexpr (kVecsPerTile > 32) {
+      if (tid % kVecsPerTile == 32)
+        smem.gate[(j * kThreadsPerBlock + tid) / kVecsPerTile][0] = total;
     }
   }
   __syncthreads();
-  if constexpr (Vecs > 32) {
-    if (tid < 64) s.sq[tid] += s.gate[tid][0];
+  if constexpr (kVecsPerTile > 32) {
+    if (tid < 64) smem.sq[tid] += smem.gate[tid][0];
     __syncthreads();
   }
   if (tid < 128) {
@@ -1193,18 +1198,19 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
     // own 32-datapath subpartition") reproduces the former warp*32 row offset, and the
     // column offset comes from the layout stride instead of being added by hand.
     auto tAccAll = cute::make_tensor(
-        cute::make_tmem_ptr<float>(s.tmem),
-        cute::make_layout(cute::make_shape(cute::Int<128>{}, cute::Int<Groups / 2 * 8 * Parts>{}),
-                          cute::make_stride(cute::TMEM::DP<float>{}, cute::_1{})));
+        cute::make_tmem_ptr<float>(smem.tmem),
+        cute::make_layout(
+            cute::make_shape(cute::Int<128>{}, cute::Int<kAccumulatorGroups / 2 * 8 * kParts>{}),
+            cute::make_stride(cute::TMEM::DP<float>{}, cute::_1{})));
     auto tiled_t2r = cute::make_tmem_copy(cute::SM100_TMEM_LOAD_32dp32b8x{}, tAccAll);
     auto thr_t2r = tiled_t2r.get_slice(tid);
     auto tSrc = thr_t2r.partition_S(tAccAll);
     auto tDst = cute::make_fragment_like<float>(thr_t2r.partition_D(tAccAll));
     cute::copy(tiled_t2r, tSrc, tDst);
     cutlass::arch::fence_view_async_tmem_load();
-    // Columns are laid out part-major, so column % 8 is the projection channel and the
+    // kTmemColumns are laid out part-major, so column % 8 is the projection channel and the
     // value index within the atom is that channel. Summing every column of the thread's
-    // datapath reproduces the former partial[] accumulation over parts and groups.
+    // datapath reproduces the former partial[] accumulation over parts and groupsmem.
     float projection[8] = {};
 #pragma unroll
     for (int n = 0; n < cute::size<2>(tDst); ++n) {
@@ -1218,7 +1224,7 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
     const int row = warp * 16 + lane;
     if (lane < 16) {
 #pragma unroll
-      for (int p = 0; p < 8; ++p) s.projection[row][p] = projection[p];
+      for (int p = 0; p < 8; ++p) smem.projection[row][p] = projection[p];
     }
     ihc_tmem_fence_before_sync();
   }
@@ -1226,83 +1232,86 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   if (tid < 32) {
     ihc_tmem_fence_after_sync();
     cute::TMEM::Allocator1Sm alloc;
-    alloc.free(s.tmem, Columns);
+    alloc.free(smem.tmem, kTmemColumns);
   }
   cluster.sync();
   if (rank == 0 && tid < valid) {
     float projection[8] = {}, total = 0;
 #pragma unroll
-    for (int b = 0; b < Blocks; ++b) {
-      const auto* remote = cluster.map_shared_rank(&s, b);
+    for (int b = 0; b < kBlocks; ++b) {
+      const auto* remote = cluster.map_shared_rank(&smem, b);
       total += remote->sq[tid];
 #pragma unroll
       for (int p = 0; p < 8; ++p) projection[p] += remote->projection[tid][p];
     }
-    const float inv = rsqrtf_ftz(total * (1.f / (4 * D)) + norm_eps);
+    const float inv = rsqrtf_ftz(total * (1.f / (4 * kHiddenDim)) + norm_eps);
 #pragma unroll
     for (int p = 0; p < 4; ++p) {
-      s.gate[tid][p] = sigmoid(scale[0] * (projection[p] * inv) + bias[p]) + eps;
-      hp[(base + tid) * 4 + p] =
-          magnitude * sigmoid(scale[1] * (projection[p + 4] * inv) + bias[p + 4]) + eps;
+      smem.gate[tid][p] =
+          sigmoid(hc_scale_ptr[0] * (projection[p] * inv) + hc_base_ptr[p]) + hc_eps;
+      H_post_out_ptr[(base + tid) * 4 + p] =
+          magnitude * sigmoid(hc_scale_ptr[1] * (projection[p + 4] * inv) + hc_base_ptr[p + 4]) +
+          hc_eps;
     }
   }
   cluster.sync();
-  const auto* root = cluster.map_shared_rank(&s, 0);
+  const auto* root = cluster.map_shared_rank(&smem, 0);
 #pragma unroll 1
   for (int row = warp; row < valid; row += 8) {
-    constexpr int Chunks = Slice / (32 * E);
+    constexpr int Chunks = kSlice / (32 * kElementsPerThread);
     const auto gates = load<float, 4>(&root->gate[row][0]);
     float total = 0;
 #pragma unroll
     for (int chunk = 0; chunk < Chunks; ++chunk) {
-      const int col = rank * Slice + (chunk * 32 + lane) * E;
-      vec_t<float, E> v{};
+      const int col = rank * kSlice + (chunk * 32 + lane) * kElementsPerThread;
+      vec_t<float, kElementsPerThread> v{};
       auto* v2 = reinterpret_cast<float2*>(&v[0]);
 #pragma unroll
       for (int p = 0; p < 4; ++p) {
-        const auto in =
-            to<float>(load<__nv_bfloat16, E>(y + int64_t(base + row) * 4 * D + p * D + col));
+        const auto in = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+            y_ptr + int64_t(base + row) * 4 * kHiddenDim + p * kHiddenDim + col));
         const auto* in2 = reinterpret_cast<const float2*>(&in[0]);
 #pragma unroll
-        for (int q = 0; q < E / 2; ++q)
+        for (int q = 0; q < kElementsPerThread / 2; ++q)
           v2[q] = ihc_fma2(make_float2(gates[p], gates[p]), in2[q], v2[q]);
       }
       const auto bf = to<__nv_bfloat162>(v);
-      store(z + int64_t(base + row) * D + col, bf);
-      if constexpr (Norm) {
+      store(z_ptr + int64_t(base + row) * kHiddenDim + col, bf);
+      if constexpr (kFuseRmsNorm) {
         v = to<float>(bf);
 #pragma unroll
-        for (int q = 0; q < E; ++q) total += v[q] * v[q];
+        for (int q = 0; q < kElementsPerThread; ++q) total += v[q] * v[q];
       }
     }
-    if constexpr (Norm) {
+    if constexpr (kFuseRmsNorm) {
       total = warp_reduce_sum_xor(total);
-      if (lane == 0) s.normsum[row] = total;
+      if (lane == 0) smem.normsum[row] = total;
     }
   }
-  if constexpr (Norm) {
+  if constexpr (kFuseRmsNorm) {
     cluster.sync();
     if (rank == 0 && tid < valid) {
       float total = 0;
 #pragma unroll
-      for (int b = 0; b < Blocks; ++b) total += cluster.map_shared_rank(&s, b)->normsum[tid];
-      s.normsum[tid] = rsqrtf_ftz(total * (1.f / D) + rms_eps);
+      for (int b = 0; b < kBlocks; ++b) total += cluster.map_shared_rank(&smem, b)->normsum[tid];
+      smem.normsum[tid] = rsqrtf_ftz(total * (1.f / kHiddenDim) + rms_eps);
     }
     cluster.sync();
 #pragma unroll 1
     for (int row = warp; row < valid; row += 8) {
       const float inv = root->normsum[row];
 #pragma unroll
-      for (int chunk = 0; chunk < Slice / (32 * E); ++chunk) {
-        const int col = rank * Slice + (chunk * 32 + lane) * E;
-        auto v = to<float>(load<__nv_bfloat16, E>(z + int64_t(base + row) * D + col));
-        const auto g = to<float>(load<__nv_bfloat16, E>(gamma + col));
+      for (int chunk = 0; chunk < kSlice / (32 * kElementsPerThread); ++chunk) {
+        const int col = rank * kSlice + (chunk * 32 + lane) * kElementsPerThread;
+        auto v = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+            z_ptr + int64_t(base + row) * kHiddenDim + col));
+        const auto g = to<float>(load<__nv_bfloat16, kElementsPerThread>(rms_weight_ptr + col));
         auto* v2 = reinterpret_cast<float2*>(&v[0]);
         const auto* g2 = reinterpret_cast<const float2*>(&g[0]);
 #pragma unroll
-        for (int q = 0; q < E / 2; ++q)
+        for (int q = 0; q < kElementsPerThread / 2; ++q)
           v2[q] = ihc_mul2(ihc_mul2(v2[q], make_float2(inv, inv)), g2[q]);
-        store(z + int64_t(base + row) * D + col, to<__nv_bfloat16>(v));
+        store(z_ptr + int64_t(base + row) * kHiddenDim + col, to<__nv_bfloat16>(v));
       }
     }
   }
