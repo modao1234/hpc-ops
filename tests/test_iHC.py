@@ -135,11 +135,26 @@ def naive_fuse_ihc_post_pre(
     return y, z, H_post_out
 
 
-@pytest.mark.parametrize("num_batch", [1, 7, 128, 512, 513, 545, 16384])
+@pytest.mark.parametrize(
+    ("num_batch", "hidden_dim", "weight_offset"),
+    [
+        (num_batch, hidden_dim, 0)
+        for hidden_dim in (6144, 4096, 3072)
+        for num_batch in (1, 7, 128, 512, 513, 545, 16384)
+    ]
+    + [
+        (79, 6144, 0),
+        (80, 6144, 0),
+        (296, 6144, 0),
+        (297, 6144, 0),
+        (80, 6144, 4),
+        (296, 6144, 4),
+        (297, 6144, 4),
+    ],
+)
 @pytest.mark.parametrize("hc_mult", [4])
-@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
 @pytest.mark.parametrize("fuse_norm", [False, True])
-def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm):
+def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm, weight_offset):
     torch.cuda.manual_seed(13)
     norm_eps, hc_eps, magnitude, rms_eps = 1e-5, 1e-6, 2.0, 1e-5
 
@@ -150,7 +165,10 @@ def test_fuse_ihc_post_pre(num_batch, hc_mult, hidden_dim, fuse_norm):
         dtype=torch.bfloat16
     )
     H_post_in = torch.rand((num_batch, hc_mult), dtype=torch.float32, device="cuda")
-    w = torch.rand((2 * hc_mult, hc_mult * hidden_dim), dtype=torch.float32, device="cuda") * 6e-3
+    weight_rows, weight_cols = 2 * hc_mult, hc_mult * hidden_dim
+    w = torch.rand(weight_rows * weight_cols + weight_offset, dtype=torch.float32, device="cuda")
+    w = w[weight_offset:].view(weight_rows, weight_cols).mul_(6e-3)
+    assert w.data_ptr() % 32 == weight_offset * w.element_size()
     hc_scale = torch.rand((2,), dtype=torch.float32, device="cuda")
     hc_base = torch.rand((2 * hc_mult,), dtype=torch.float32, device="cuda")
     rms_weight = (
@@ -444,3 +462,94 @@ def test_fuse_ihc_head_with_rms_weight(num_batch, hidden_dim, norm_eps, hc_eps):
     )
 
     assert allclose(ref_y, real_y, atol=2e-2, rtol=1e-2)
+
+
+@pytest.fixture
+def splitk_force():
+    """Restore automatic dispatch after a test pins one of the split-K paths."""
+    yield
+    torch.ops.hpc.ihc_set_splitk_force(0)
+    torch.ops.hpc.ihc_set_head_splitk_force(0)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_pre_splitk_force_matches_row(num_batch, hidden_dim, splitk_force):
+    """Both pre implementations must agree on one input, and the knob must bite."""
+    x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
+
+    torch.ops.hpc.ihc_set_splitk_force(2)
+    row_y, row_post = hpc.fuse_ihc_pre(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE)
+    torch.ops.hpc.ihc_set_splitk_force(1)
+    sk_y, sk_post = hpc.fuse_ihc_pre(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE)
+
+    torch.testing.assert_close(sk_y.float(), row_y.float(), atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(sk_post, row_post, atol=2e-5, rtol=1e-4)
+
+    # At one token automatic dispatch picks split-K on every supported shape, so the
+    # automatic result must equal the forced one bit for bit.
+    if num_batch == 1:
+        torch.ops.hpc.ihc_set_splitk_force(0)
+        auto_y, auto_post = hpc.fuse_ihc_pre(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE)
+        assert torch.equal(auto_y, sk_y), "automatic dispatch no longer selects split-K at n=1"
+        assert torch.equal(auto_post, sk_post)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_pre_splitk_force_with_rms_weight(num_batch, hidden_dim, splitk_force):
+    """The folded-RMSNorm split-K variant must match the row kernel too."""
+    x, w, hc_scale, hc_base = make_pre_inputs(num_batch, hidden_dim)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device="cuda").to(
+        dtype=torch.bfloat16
+    )
+
+    torch.ops.hpc.ihc_set_splitk_force(2)
+    row_y, row_post = hpc.fuse_ihc_pre(
+        x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE, rms_weight, RMS_EPS
+    )
+    torch.ops.hpc.ihc_set_splitk_force(1)
+    sk_y, sk_post = hpc.fuse_ihc_pre(
+        x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, MAGNITUDE, rms_weight, RMS_EPS
+    )
+
+    torch.testing.assert_close(sk_y.float(), row_y.float(), atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(sk_post, row_post, atol=2e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64, 512])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_head_splitk_force_matches_row(num_batch, hidden_dim, splitk_force):
+    x, w, hc_scale, hc_base = make_head_inputs(num_batch, hidden_dim)
+
+    torch.ops.hpc.ihc_set_head_splitk_force(2)
+    row = hpc.fuse_ihc_head(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS)
+    torch.ops.hpc.ihc_set_head_splitk_force(1)
+    sk = hpc.fuse_ihc_head(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS)
+
+    torch.testing.assert_close(sk.float(), row.float(), atol=2e-2, rtol=1e-2)
+
+    if num_batch == 1:
+        torch.ops.hpc.ihc_set_head_splitk_force(0)
+        auto = hpc.fuse_ihc_head(x, w, hc_scale, hc_base, RMS_EPS, HC_EPS)
+        assert torch.equal(auto, sk), "automatic dispatch no longer selects split-K at n=1"
+
+
+@pytest.mark.parametrize("num_batch", [1, 7, 64])
+@pytest.mark.parametrize("hidden_dim", [6144, 4096, 3072])
+def test_fuse_ihc_head_splitk_force_with_rms_weight(num_batch, hidden_dim, splitk_force):
+    x, w, hc_scale, hc_base = make_head_inputs(num_batch, hidden_dim)
+    rms_weight = torch.rand((hidden_dim,), dtype=torch.float32, device="cuda").to(
+        dtype=torch.bfloat16
+    )
+
+    torch.ops.hpc.ihc_set_head_splitk_force(2)
+    row = torch.ops.hpc.fuse_ihc_head(
+        x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, rms_weight, RMS_EPS
+    )
+    torch.ops.hpc.ihc_set_head_splitk_force(1)
+    sk = torch.ops.hpc.fuse_ihc_head(
+        x, w, hc_scale, hc_base, RMS_EPS, HC_EPS, rms_weight, RMS_EPS
+    )
+
+    torch.testing.assert_close(sk.float(), row.float(), atol=2e-2, rtol=1e-2)

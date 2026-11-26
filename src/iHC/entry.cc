@@ -322,6 +322,17 @@ TORCH_LIBRARY_FRAGMENT(hpc, m) {
   m.def("fuse_ihc_post(Tensor x, Tensor residual, Tensor H_post) -> Tensor output");
   m.impl("fuse_ihc_post", torch::kCUDA, &hpc::iHC::fuse_ihc_post_entry);
 
+  // Test hooks: pin the split-K or the row implementation so a single input can run
+  // through both and the outputs be compared. 0=automatic, 1=split-K, 2=row.
+  m.def("ihc_set_splitk_force(int mode) -> ()");
+  m.impl("ihc_set_splitk_force", [](int64_t mode) {
+    hpc::iHC::splitk::ihc_set_splitk_force(static_cast<int>(mode));
+  });
+  m.def("ihc_set_head_splitk_force(int mode) -> ()");
+  m.impl("ihc_set_head_splitk_force", [](int64_t mode) {
+    hpc::iHC::splitk::ihc_set_head_splitk_force(static_cast<int>(mode));
+  });
+
   m.def(
       "fuse_ihc_head(Tensor x, Tensor w, Tensor hc_scale, Tensor hc_base, float norm_eps, float "
       "hc_eps, Tensor? rms_weight=None, float rms_eps=0.0, bool cast_bfloat_for_norm=False) "
