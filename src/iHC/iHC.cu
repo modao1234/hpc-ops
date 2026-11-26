@@ -1017,8 +1017,6 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   using Storage = IhcPostPreUmmaStorage<BK, Parts>;
   using LA = typename Storage::LA;
   using LB = typename Storage::LB;
-  using MMA = cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
-                                         cute::UMMA::Major::K, cute::UMMA::Major::K>;
   extern __shared__ __align__(1024) unsigned char storage[];
   auto& s = *reinterpret_cast<Storage*>(storage);
   auto cluster = cooperative_groups::this_cluster();
@@ -1047,39 +1045,36 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   using LDB = cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
                                    cute::Layout<cute::Shape<cute::Int<8 * Parts>, cute::_64>,
                                                 cute::Stride<cute::_64, cute::_1>>>;
-  // Pre-compute per-slot UMMA descriptors from the LDA/LDB half-tile layouts.
-  // kDescStepPerKTile: each k-tile covers 16 bfloat16 elements = 32 bytes;
-  // UMMA descriptor unit = 16 bytes → 2 units per k-tile step.
-  constexpr int kDescStepPerKTile = (16 * static_cast<int>(sizeof(cute::bfloat16_t))) / 16;
-  const uint64_t ad_slot[2] = {
-      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
-          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LDA{})),
-      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
-          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LDA{})),
-  };
-  const uint64_t bd_slot[2] = {
-      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
-          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LDB{})),
-      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
-          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LDB{})),
-  };
-  const auto id =
-      cute::UMMA::make_runtime_instr_desc<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
-                                          cute::UMMA::Major::K, cute::UMMA::Major::K>();
-  // Per-slot smem tensors using the full-buffer LA/LB layouts from IhcPostPreUmmaStorage.
-  // CuTe's ComposedLayout handles swizzle at coordinate access; no manual Swizzle arithmetic
-  // needed at the store sites.
-  auto sA0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LA{});
-  auto sA1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LA{});
-  auto sB0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LB{});
-  auto sB1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LB{});
-  // TMEM addressing constants for the Groups=8, Parts=3 accumulator layout.
-  // kTmemAccWidth:        column span per accumulator group = 8 * Parts floats.
-  // kTmemRowStride:       address step per TMEM row (32 K-row addressing, bit 16).
-  // kTmemPartitionStride: high/low 32 K partition selector (bit 20).
-  constexpr uint32_t kTmemAccWidth        = 8 * Parts;
-  constexpr uint32_t kTmemRowStride       = 1u << 16;
-  constexpr uint32_t kTmemPartitionStride = 1u << 20;
+  // TiledMma drives cute::gemm below; the UMMA descriptors are derived from the smem
+  // tensor layouts instead of being assembled by hand.
+  using TiledMma = decltype(cute::make_tiled_mma(
+      cute::SM100_MMA_F16BF16_SS<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
+                                 cute::UMMA::Major::K, cute::UMMA::Major::K>{}));
+  TiledMma tiled_mma;
+  auto thr_mma = tiled_mma.get_slice(0);  // 1SM: every warp sees the same slice
+  // Accumulator fragment layout for one 64 x (8 * Parts) TMEM tile.
+  const auto tAccr_layout =
+      thr_mma
+          .partition_fragment_C(cute::make_tensor(
+              cute::make_gmem_ptr(static_cast<float*>(nullptr)),
+              cute::make_shape(cute::Int<64>{}, cute::Int<8 * Parts>{}),
+              cute::make_stride(cute::Int<8 * Parts>{}, cute::Int<1>{})))
+          .layout();
+  // Per-slot smem tensors. The full LA/LB layouts apply the Swizzle<3,4,3> permutation at
+  // coordinate access, so the store sites need no hand-written swizzle arithmetic.
+  // Each slot gets its own tensor and the slot branch is hoisted out of the element loops
+  // below, keeping every branch statically resolvable.
+  auto sA0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])),
+                               LA{});
+  auto sA1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])),
+                               LA{});
+  auto sB0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])),
+                               LB{});
+  auto sB1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])),
+                               LB{});
+  // TMEM addressing for the Groups=8, Parts=3 accumulator layout.
+  constexpr uint32_t kTmemAccWidth        = 8 * Parts;   // columns per accumulator group
+  constexpr uint32_t kTmemPartitionStride = 1u << 20;    // high/low 32K partition selector
   int phase[2] = {0, 0};
   constexpr int TilesPerChannel = Slice / BK;
   // Keep each XA tile hot while visiting all channels for D6144.
@@ -1096,55 +1091,73 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
         phase[slot] ^= 1;
         __syncthreads();
       }
+      // The slot branch is resolved once per tile: each branch instantiates the whole
+      // fill with a compile-time tensor, so the swizzled addresses fold to constants
+      // exactly as the former hand-written form did.
+      auto fill_smem = [&](auto& sA, auto& sB) {
 #pragma unroll
-      for (int j = 0; j < RowsPerThread; ++j) {
-        const int idx = j * T + tid, row = idx / Vecs, k = (idx % Vecs) * E,
-                  col = rank * Slice + k0 + k;
-        vec_t<__nv_bfloat16, E> bf{};
-        if (row < valid) {
-          const auto a = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + row) * D + col));
-          const auto b = to<float>(
-              load<__nv_bfloat16, E>(residual + int64_t(base + row) * 4 * D + ch * D + col));
-          const float h = hi[(base + row) * 4 + ch];
-          vec_t<float, E> v;
-          auto* v2 = reinterpret_cast<float2*>(&v[0]);
-          const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
-          const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
+        for (int j = 0; j < RowsPerThread; ++j) {
+          const int idx = j * T + tid, row = idx / Vecs, k = (idx % Vecs) * E,
+                    col = rank * Slice + k0 + k;
+          vec_t<__nv_bfloat16, E> bf{};
+          if (row < valid) {
+            const auto a = to<float>(load<__nv_bfloat16, E>(xa + int64_t(base + row) * D + col));
+            const auto b = to<float>(
+                load<__nv_bfloat16, E>(residual + int64_t(base + row) * 4 * D + ch * D + col));
+            const float h = hi[(base + row) * 4 + ch];
+            vec_t<float, E> v;
+            auto* v2 = reinterpret_cast<float2*>(&v[0]);
+            const auto* a2 = reinterpret_cast<const float2*>(&a[0]);
+            const auto* b2 = reinterpret_cast<const float2*>(&b[0]);
 #pragma unroll
-          for (int q = 0; q < E / 2; ++q) v2[q] = ihc_fma2(make_float2(h, h), a2[q], b2[q]);
-          bf = to<__nv_bfloat16>(v);
-          store(y + int64_t(base + row) * 4 * D + ch * D + col, bf);
-          v = to<float>(bf);
+            for (int q = 0; q < E / 2; ++q) v2[q] = ihc_fma2(make_float2(h, h), a2[q], b2[q]);
+            bf = to<__nv_bfloat16>(v);
+            store(y + int64_t(base + row) * 4 * D + ch * D + col, bf);
+            v = to<float>(bf);
 #pragma unroll
-          for (int q = 0; q < E; ++q) sq[j] += v[q] * v[q];
+            for (int q = 0; q < E; ++q) sq[j] += v[q] * v[q];
+          }
+          store(reinterpret_cast<__nv_bfloat16*>(&sA(row, k)), bf);
         }
-        auto& dst_a = slot == 0 ? sA0(row, k) : sA1(row, k);
-        store(reinterpret_cast<__nv_bfloat16*>(&dst_a), bf);
-      }
-      // Preserve the FP32 weight residuals in separate BF16 projection terms.
-      for (int idx = tid; idx < 8 * Vecs; idx += T) {
-        const int p = idx / Vecs, k = (idx % Vecs) * E;
-        auto ww = ihc_load_weight8<true>(w + int64_t(p) * 4 * D + ch * D + rank * Slice + k0 + k);
+        // Preserve the FP32 weight residuals in separate BF16 projection terms.
+        for (int idx = tid; idx < 8 * Vecs; idx += T) {
+          const int p = idx / Vecs, k = (idx % Vecs) * E;
+          auto ww =
+              ihc_load_weight8<true>(w + int64_t(p) * 4 * D + ch * D + rank * Slice + k0 + k);
 #pragma unroll
-        for (int part = 0; part < Parts; ++part) {
-          const auto bf = to<__nv_bfloat16>(ww);
-          auto& dst_b = slot == 0 ? sB0(part * 8 + p, k) : sB1(part * 8 + p, k);
-          store(reinterpret_cast<__nv_bfloat16*>(&dst_b), bf);
-          const auto rounded = to<float>(bf);
+          for (int part = 0; part < Parts; ++part) {
+            const auto bf = to<__nv_bfloat16>(ww);
+            store(reinterpret_cast<__nv_bfloat16*>(&sB(part * 8 + p, k)), bf);
+            const auto rounded = to<float>(bf);
 #pragma unroll
-          for (int q = 0; q < E; ++q) ww[q] -= rounded[q];
+            for (int q = 0; q < E; ++q) ww[q] -= rounded[q];
+          }
         }
+      };
+      if (slot == 0) {
+        fill_smem(sA0, sB0);
+      } else {
+        fill_smem(sA1, sB1);
       }
       cutlass::arch::fence_view_async_shared();
       __syncthreads();
       if (tid < 32) {
+        // One gemm block per tile: partition the slot's smem tensors, take the MMA
+        // fragments, then accumulate into this tile's TMEM group.
+        auto tAs = thr_mma.make_fragment_A(thr_mma.partition_A(slot == 0 ? sA0 : sA1));
+        auto tBs = thr_mma.make_fragment_B(thr_mma.partition_B(slot == 0 ? sB0 : sB1));
+        auto tAccr = cute::make_tensor(
+            cute::make_tmem_ptr<float>(s.tmem + ((tile % Groups) / 2) * kTmemAccWidth +
+                                       ((tile % Groups) & 1) * kTmemPartitionStride),
+            tAccr_layout);
+        // The first Groups tiles seed their group; later tiles accumulate onto it.
+        tiled_mma.accumulate_ =
+            tile < Groups ? cute::UMMA::ScaleOut::Zero : cute::UMMA::ScaleOut::One;
 #pragma unroll
-        for (int k = 0; k < BK; k += 16)
-          MMA::fma(ad_slot[slot] + (k / 16) * kDescStepPerKTile,
-                   bd_slot[slot] + (k / 16) * kDescStepPerKTile,
-                   s.tmem + ((tile % Groups) / 2) * kTmemAccWidth +
-                       ((tile % Groups) & 1) * kTmemPartitionStride,
-                   (tile >= Groups || k != 0), id);
+        for (int ik = 0; ik < cute::size<2>(tAs); ++ik) {
+          cute::gemm(tiled_mma, tAs(cute::_, cute::_, ik), tBs(cute::_, cute::_, ik), tAccr);
+          tiled_mma.accumulate_ = cute::UMMA::ScaleOut::One;
+        }
         cutlass::arch::umma_arrive(&s.barrier[slot]);
       }
       __syncthreads();
@@ -1175,24 +1188,30 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
     __syncthreads();
   }
   if (tid < 128) {
+    // TMEM -> registers through CuTe. The tensor covers every datapath and every
+    // accumulator column; the copy atom's thread layout ("4 warps, each addressing its
+    // own 32-datapath subpartition") reproduces the former warp*32 row offset, and the
+    // column offset comes from the layout stride instead of being added by hand.
+    auto tAccAll = cute::make_tensor(
+        cute::make_tmem_ptr<float>(s.tmem),
+        cute::make_layout(cute::make_shape(cute::Int<128>{}, cute::Int<Groups / 2 * 8 * Parts>{}),
+                          cute::make_stride(cute::TMEM::DP<float>{}, cute::_1{})));
+    auto tiled_t2r = cute::make_tmem_copy(cute::SM100_TMEM_LOAD_32dp32b8x{}, tAccAll);
+    auto thr_t2r = tiled_t2r.get_slice(tid);
+    auto tSrc = thr_t2r.partition_S(tAccAll);
+    auto tDst = cute::make_fragment_like<float>(thr_t2r.partition_D(tAccAll));
+    cute::copy(tiled_t2r, tSrc, tDst);
+    cutlass::arch::fence_view_async_tmem_load();
+    // Columns are laid out part-major, so column % 8 is the projection channel and the
+    // value index within the atom is that channel. Summing every column of the thread's
+    // datapath reproduces the former partial[] accumulation over parts and groups.
     float projection[8] = {};
 #pragma unroll
-    for (int group = 0; group < Groups / 2; ++group) {
-      float partial[8] = {};
+    for (int n = 0; n < cute::size<2>(tDst); ++n) {
 #pragma unroll
-      for (int part = Parts - 1; part >= 0; --part) {
-        uint32_t v[8];
-        cute::SM100_TMEM_LOAD_32dp32b8x::copy(
-            s.tmem + static_cast<uint32_t>(warp * 32) * kTmemRowStride +
-                group * kTmemAccWidth + part * 8,
-            v[0], v[1], v[2], v[3],
-            v[4], v[5], v[6], v[7]);
-        cutlass::arch::fence_view_async_tmem_load();
-#pragma unroll
-        for (int p = 0; p < 8; ++p) partial[p] += __uint_as_float(v[p]);
+      for (int v = 0; v < 8; ++v) {
+        projection[v] += tDst(v, 0, n);
       }
-#pragma unroll
-      for (int p = 0; p < 8; ++p) projection[p] += partial[p];
     }
 #pragma unroll
     for (int p = 0; p < 8; ++p) projection[p] += __shfl_xor_sync(0xffffffff, projection[p], 16);
