@@ -283,7 +283,6 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   }
 }
 
-
 static constexpr int kStage1Threads = 128;
 static constexpr int kStage2Threads = 256;
 static constexpr int kElementsPerThread = 8;
@@ -401,10 +400,10 @@ void launch_splitk(__nv_bfloat16* output_y_ptr, float* output_H_post_ptr,
     cudaLaunchKernelEx(&cfg1, stage1, scratch_ptr, x_ptr, w_ptr, num_batch);
 
     // RMSNorm requires one block to cover the full hidden row.
-    constexpr int kStage2ThreadsHere =
-        kFuseRmsNorm ? kHiddenDim / kElementsPerThread
-        : kHiddenDim % (kStage2Threads * kElementsPerThread) == 0 ? kStage2Threads
-                                                                   : 192;
+    constexpr int kStage2ThreadsHere = kFuseRmsNorm ? kHiddenDim / kElementsPerThread
+                                       : kHiddenDim % (kStage2Threads * kElementsPerThread) == 0
+                                           ? kStage2Threads
+                                           : 192;
     constexpr int kBlockD = kStage2ThreadsHere * kElementsPerThread;
     constexpr int kHiddenBlocks = kHiddenDim / kBlockD;
     static_assert(kStage2ThreadsHere <= 1024, "stage2 block exceeds the CUDA limit");
