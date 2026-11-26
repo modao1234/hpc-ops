@@ -1073,6 +1073,13 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   auto sA1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LA{});
   auto sB0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LB{});
   auto sB1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LB{});
+  // TMEM addressing constants for the Groups=8, Parts=3 accumulator layout.
+  // kTmemAccWidth:        column span per accumulator group = 8 * Parts floats.
+  // kTmemRowStride:       address step per TMEM row (32 K-row addressing, bit 16).
+  // kTmemPartitionStride: high/low 32 K partition selector (bit 20).
+  constexpr uint32_t kTmemAccWidth        = 8 * Parts;
+  constexpr uint32_t kTmemRowStride       = 1u << 16;
+  constexpr uint32_t kTmemPartitionStride = 1u << 20;
   int phase[2] = {0, 0};
   constexpr int TilesPerChannel = Slice / BK;
   // Keep each XA tile hot while visiting all channels for D6144.
@@ -1135,7 +1142,8 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
         for (int k = 0; k < BK; k += 16)
           MMA::fma(ad_slot[slot] + (k / 16) * kDescStepPerKTile,
                    bd_slot[slot] + (k / 16) * kDescStepPerKTile,
-                   s.tmem + ((tile % Groups) / 2) * (8 * Parts) + (((tile % Groups) & 1) << 20),
+                   s.tmem + ((tile % Groups) / 2) * kTmemAccWidth +
+                       ((tile % Groups) & 1) * kTmemPartitionStride,
                    (tile >= Groups || k != 0), id);
         cutlass::arch::umma_arrive(&s.barrier[slot]);
       }
@@ -1175,7 +1183,9 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
       for (int part = Parts - 1; part >= 0; --part) {
         uint32_t v[8];
         cute::SM100_TMEM_LOAD_32dp32b8x::copy(
-            s.tmem + (warp * 32 << 16) + group * (8 * Parts) + part * 8, v[0], v[1], v[2], v[3],
+            s.tmem + static_cast<uint32_t>(warp * 32) * kTmemRowStride +
+                group * kTmemAccWidth + part * 8,
+            v[0], v[1], v[2], v[3],
             v[4], v[5], v[6], v[7]);
         cutlass::arch::fence_view_async_tmem_load();
 #pragma unroll
