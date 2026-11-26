@@ -1056,6 +1056,13 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   const auto id =
       cute::UMMA::make_runtime_instr_desc<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
                                           cute::UMMA::Major::K, cute::UMMA::Major::K>();
+  // Per-slot smem tensors using the full-buffer LA/LB layouts from IhcPostPreUmmaStorage.
+  // CuTe's ComposedLayout handles swizzle at coordinate access; no manual Swizzle arithmetic
+  // needed at the store sites.
+  auto sA0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LA{});
+  auto sA1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LA{});
+  auto sB0 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LB{});
+  auto sB1 = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LB{});
   int phase[2] = {0, 0};
   constexpr int TilesPerChannel = Slice / BK;
   // Keep each XA tile hot while visiting all channels for D6144.
@@ -1094,7 +1101,8 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
 #pragma unroll
           for (int q = 0; q < E; ++q) sq[j] += v[q] * v[q];
         }
-        store(s.a[slot] + cute::Swizzle<3, 4, 3>{}(LA{}.layout_b()(row, k) * 2) / 2, bf);
+        auto& dst_a = slot == 0 ? sA0(row, k) : sA1(row, k);
+        store(reinterpret_cast<__nv_bfloat16*>(&dst_a), bf);
       }
       // Preserve the FP32 weight residuals in separate BF16 projection terms.
       for (int idx = tid; idx < 8 * Vecs; idx += T) {
@@ -1103,7 +1111,8 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
 #pragma unroll
         for (int part = 0; part < Parts; ++part) {
           const auto bf = to<__nv_bfloat16>(ww);
-          store(s.b[slot] + cute::Swizzle<3, 4, 3>{}(LB{}.layout_b()(part * 8 + p, k) * 2) / 2, bf);
+          auto& dst_b = slot == 0 ? sB0(part * 8 + p, k) : sB1(part * 8 + p, k);
+          store(reinterpret_cast<__nv_bfloat16*>(&dst_b), bf);
           const auto rounded = to<float>(bf);
 #pragma unroll
           for (int q = 0; q < E; ++q) ww[q] -= rounded[q];
