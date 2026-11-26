@@ -164,9 +164,8 @@ __device__ __forceinline__ void ihc_mix_epilogue(__nv_bfloat16* out, const __nv_
 
 namespace kernels {
 
-constexpr int ihc_post_pre_cluster_blocks(int hidden_dim) { return hidden_dim == 3072 ? 6 : 8; }
-
-constexpr int ihc_post_pre_umma_blocks(int hidden_dim) { return hidden_dim == 3072 ? 6 : 8; }
+// Number of blocks per cluster for the fused post-pre cluster and UMMA paths.
+constexpr int ihc_post_pre_num_blocks(int hidden_dim) { return hidden_dim == 3072 ? 6 : 8; }
 
 template <int D, int Blocks, bool Norm, bool Cast, bool PDL = false>
 __device__ __forceinline__ void ihc_post_pre_cluster_device(
@@ -847,34 +846,30 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
   auto reg_H_post = load<float, kHCMult>(H_post_ptr + irow * kHCMult);
 
   const int icol = (blockIdx.y * blockDim.x + threadIdx.x) * kElementsPerThread;
-  const int icol_stride = gridDim.y * blockDim.x * kElementsPerThread;
-  const int num_iter = (kHiddenDim - icol + icol_stride - 1) / icol_stride;
-
+  // gridDim.y == kHiddenDim / (blockDim.x * kElementsPerThread): one pass covers the full row.
   const __nv_bfloat16* x_row_ptr = x_ptr + irow * kHiddenDim + icol;
   const __nv_bfloat16* residual_row_ptr = residual_ptr + irow * kHCMult * kHiddenDim + icol;
   __nv_bfloat16* output_row_ptr = output_ptr + irow * kHCMult * kHiddenDim + icol;
 
-  for (int iter = 0; iter < num_iter; ++iter) {
-    auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(x_row_ptr + iter * icol_stride));
+  auto reg_x = to<float>(load<__nv_bfloat16, kElementsPerThread>(x_row_ptr));
 
 #pragma unroll
-    for (int i = 0; i < kHCMult; ++i) {
-      auto reg_residual = to<float>(load<__nv_bfloat16, kElementsPerThread>(
-          residual_row_ptr + i * kHiddenDim + iter * icol_stride));
+  for (int i = 0; i < kHCMult; ++i) {
+    auto reg_residual = to<float>(load<__nv_bfloat16, kElementsPerThread>(
+        residual_row_ptr + i * kHiddenDim));
 
-      vec_t<float, kElementsPerThread> reg_output;
-      auto* o2 = reinterpret_cast<float2*>(&reg_output[0]);
-      const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
-      const auto* r2 = reinterpret_cast<const float2*>(&reg_residual[0]);
-      const float h = reg_H_post[i];
+    vec_t<float, kElementsPerThread> reg_output;
+    auto* o2 = reinterpret_cast<float2*>(&reg_output[0]);
+    const auto* x2 = reinterpret_cast<const float2*>(&reg_x[0]);
+    const auto* r2 = reinterpret_cast<const float2*>(&reg_residual[0]);
+    const float h = reg_H_post[i];
 #pragma unroll
-      for (int j = 0; j < kElementsPerThread / 2; ++j) {
-        o2[j].x = h * x2[j].x + r2[j].x;
-        o2[j].y = h * x2[j].y + r2[j].y;
-      }
-
-      store(output_row_ptr + i * kHiddenDim + iter * icol_stride, to<__nv_bfloat16>(reg_output));
+    for (int j = 0; j < kElementsPerThread / 2; ++j) {
+      o2[j].x = h * x2[j].x + r2[j].x;
+      o2[j].y = h * x2[j].y + r2[j].y;
     }
+
+    store(output_row_ptr + i * kHiddenDim, to<__nv_bfloat16>(reg_output));
   }
 
   if constexpr (kUsePDL) {
@@ -914,10 +909,12 @@ __global__ void __launch_bounds__(kThreads, kMinBlocksPerSm)
 #else
 // One global entry completes post, pre and optional RMSNorm. M is uniform across
 // the grid; each branch calls an inline device helper with its own fixed layout.
-template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
+// Rows path for SM90 (always) and non-SM90 (3072/4096 rows; 6144 large-batch rows-2).
+// kRows selects how many rows per block; __launch_bounds__ matches the actual block size.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, int kRows,
           bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
           bool kWeightsAligned = true>
-__global__ void __launch_bounds__(768)
+__global__ void __launch_bounds__(kThreadsPerBlock)
     fuse_ihc_post_pre_kernel(__nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
                              const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
                              const float* H_post_in_ptr, const float* w_ptr,
@@ -927,42 +924,51 @@ __global__ void __launch_bounds__(768)
   static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
   static_assert(kHiddenDim == 3072 || kHiddenDim == 4096 || kHiddenDim == 6144,
                 "supported hidden dimensions");
-  if constexpr (kHiddenDim == 6144) {
-    if (num_batch < 80) {
-      ihc_post_pre_cluster_device<kHiddenDim, 8, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    } else if (num_batch <= 296) {
-      ihc_post_pre_single_row_device<kHiddenDim, 768, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
-                                     kWeightsAligned>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    } else {
-      ihc_post_pre_rows_device<kHiddenDim, 2, 384, 384, kFuseRmsNorm, kCastBfloatForNorm, kUsePDL,
-                               kWeightsAligned>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    }
-  } else {
-    if (num_batch <= 128) {
-      ihc_post_pre_cluster_device<kHiddenDim, ihc_post_pre_cluster_blocks(kHiddenDim), kFuseRmsNorm,
-                                  kCastBfloatForNorm, kUsePDL>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    } else if (num_batch < 297) {
-      ihc_post_pre_rows_device<kHiddenDim, 1, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
-                               kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    } else {
-      ihc_post_pre_rows_device<kHiddenDim, 2, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
-                               kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
-          y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
-          hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
-    }
-  }
+  ihc_post_pre_rows_device<kHiddenDim, kRows, kThreadsPerBlock, kThreadsPerBlock, kFuseRmsNorm,
+                           kCastBfloatForNorm, kUsePDL, kWeightsAligned>(
+      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
 }
 #endif
+
+// Cluster path: each block handles hidden_dim / kBlocksPerCluster elements.
+// Block size = hidden_dim / (kBlocksPerCluster * kElementsPerThread).
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kBlocksPerCluster,
+          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false>
+__global__ void __launch_bounds__(kHiddenDim / (kBlocksPerCluster * kElementsPerThread))
+    fuse_ihc_post_pre_cluster_kernel(
+        __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
+        const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
+        const float* H_post_in_ptr, const float* w_ptr,
+        const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
+        float norm_eps, float hc_eps, float magnitude,
+        const __nv_bfloat16* rms_weight_ptr = nullptr, float rms_eps = 0.f) {
+  static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
+  ihc_post_pre_cluster_device<kHiddenDim, kBlocksPerCluster, kFuseRmsNorm, kCastBfloatForNorm,
+                              kUsePDL>(
+      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+}
+
+// Retained path for 6144 mid-batch: 768 threads per block, one block per row.
+template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock,
+          bool kUsePDL = false, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
+          bool kWeightsAligned = true>
+__global__ void __launch_bounds__(kThreadsPerBlock)
+    fuse_ihc_post_pre_retained_kernel(
+        __nv_bfloat16* y_ptr, __nv_bfloat16* z_ptr, float* H_post_out_ptr,
+        const __nv_bfloat16* xa_ptr, const __nv_bfloat16* residual_ptr,
+        const float* H_post_in_ptr, const float* w_ptr,
+        const float* hc_scale_ptr, const float* hc_base_ptr, int num_batch,
+        float norm_eps, float hc_eps, float magnitude,
+        const __nv_bfloat16* rms_weight_ptr = nullptr, float rms_eps = 0.f) {
+  static_assert(kHCMult == 4 && kElementsPerThread == 8, "supported fused layout");
+  ihc_post_pre_single_row_device<kHiddenDim, kThreadsPerBlock, kFuseRmsNorm, kCastBfloatForNorm,
+                                 kUsePDL, kWeightsAligned>(
+      y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr,
+      hc_base_ptr, num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+}
+
 
 #if HPC_TARGET_ARCH != 90
 __device__ __forceinline__ void ihc_tmem_fence_before_sync() {
@@ -993,8 +999,7 @@ struct IhcPostPreUmmaStorage {
 // accumulators across both halves to shorten the FP32 summation chains.
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
           bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, int kAccumulatorGroups>
-__global__ void __maxnreg__(64)
-    fuse_ihc_post_pre_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
+__global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
                              const __nv_bfloat16* residual, const float* hi, const float* w,
                              const float* scale, const float* bias, int m, float norm_eps,
                              float eps, float magnitude, const __nv_bfloat16* gamma,
@@ -1005,7 +1010,7 @@ __global__ void __maxnreg__(64)
   static_assert(!kFuseRmsNorm || kCastBfloatForNorm, "RMSNorm requires BF16 intermediate");
   static_assert(kAccumulatorGroups == 8, "supported TMEM layout");
   constexpr int D = kHiddenDim, BK = 128, Parts = 3, Groups = kAccumulatorGroups;
-  constexpr int Blocks = ihc_post_pre_umma_blocks(D);
+  constexpr int Blocks = ihc_post_pre_num_blocks(D);
   constexpr bool Norm = kFuseRmsNorm;
   constexpr int T = 256, E = 8, Vecs = BK / E, RowsPerThread = 64 * Vecs / T;
   constexpr int Columns = 128;
@@ -1274,11 +1279,11 @@ struct IhcPostPreThreeWarpStorage {
 template <int kHCMult, int kHiddenDim, int kElementsPerThread, int kThreadsPerBlock, bool kUsePDL,
           bool kFuseRmsNorm, bool kCastBfloatForNorm, bool kWeightsAligned, typename Layout>
 __global__ void __launch_bounds__(384, kHiddenDim == 6144 ? 1 : 2)
-    fuse_ihc_post_pre_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp, const __nv_bfloat16* xa,
-                             const __nv_bfloat16* res, const float* hi, const float* w,
-                             const float* scale, const float* bias, int m, float norm_eps,
-                             float hc_eps, float magnitude, const __nv_bfloat16* gamma,
-                             float rms_eps) {
+    fuse_ihc_post_pre_three_wg_kernel(__nv_bfloat16* y, __nv_bfloat16* z, float* hp,
+                             const __nv_bfloat16* xa, const __nv_bfloat16* res, const float* hi,
+                             const float* w, const float* scale, const float* bias, int m,
+                             float norm_eps, float hc_eps, float magnitude,
+                             const __nv_bfloat16* gamma, float rms_eps) {
   static_assert(std::is_same_v<Layout, IhcPostPreThreeWarpGroups>, "supported warp layout");
   static_assert(
       kHCMult == 4 && kElementsPerThread == 8 && kThreadsPerBlock == 384 && kWeightsAligned,
@@ -1835,8 +1840,8 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     constexpr int kUmmaMin = kHiddenDim == 3072 ? 8960 : 8192;
     if (num_batch >= kUmmaMin && weights_aligned) {
       constexpr int kUmmaThreads = 256;
-      constexpr int kUmmaBlocks = kernels::ihc_post_pre_umma_blocks(kHiddenDim);
-      auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kUmmaThreads, kUsePDL,
+      constexpr int kUmmaBlocks = kernels::ihc_post_pre_num_blocks(kHiddenDim);
+      auto kernel = kernels::fuse_ihc_post_pre_umma_kernel<4, kHiddenDim, 8, kUmmaThreads, kUsePDL,
                                                       kFuseRmsNorm, kCastBfloatForNorm, true, 8>;
       constexpr size_t kShared = sizeof(kernels::IhcPostPreUmmaStorage<128, 3>);
       const cudaError_t setup =
@@ -1865,7 +1870,7 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
           kHiddenDim == 6144 ? 80 : kHiddenDim == 3072 ? (kFuseRmsNorm ? 48 : 72) : 149;
       const int three_warp_max = kHiddenDim == 3072 ? 4 * get_sm_count() : 296;
       if (num_batch >= kThreeWarpMin && num_batch <= three_warp_max && weights_aligned) {
-        auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, 384, kUsePDL,
+        auto kernel = kernels::fuse_ihc_post_pre_three_wg_kernel<4, kHiddenDim, 8, 384, kUsePDL,
                                                         kFuseRmsNorm, kCastBfloatForNorm, true,
                                                         kernels::IhcPostPreThreeWarpGroups>;
         constexpr size_t kShared =
@@ -1991,31 +1996,111 @@ cudaError_t launch_fuse_ihc_post_pre(int num_batch, cudaStream_t stream, __nv_bf
     return launch.template operator()<kHiddenThreads / 2, PostPrePath::Retained, 1, 1, 2>();
   }
 #else
-  int blocks = 1;
+  // Each path has its own kernel with matching __launch_bounds__; dispatch here.
   if constexpr (kHiddenDim == 6144) {
-    blocks = num_batch < 80 ? 8 : 1;
-    const int threads = num_batch < 80 ? 96 : num_batch <= 296 ? 768 : 384;
-    const int rows = num_batch >= 297 ? 2 : 1;
-    config.gridDim = dim3(((num_batch + rows - 1) / rows) * blocks);
-    config.blockDim = dim3(threads);
+    if (num_batch < 80) {
+      // Cluster path: 8 blocks per cluster, 96 threads each.
+      constexpr int kBlocks = kernels::ihc_post_pre_num_blocks(6144);  // 8
+      constexpr int kClusterThreads = 6144 / (kBlocks * 8);            // 96
+      config.gridDim = dim3(num_batch * kBlocks);
+      config.blockDim = dim3(kClusterThreads);
+      auto& cattr = attrs[config.numAttrs++];
+      cattr.id = cudaLaunchAttributeClusterDimension;
+      cattr.val.clusterDim = {kBlocks, 1, 1};
+      auto kernel = kernels::fuse_ihc_post_pre_cluster_kernel<4, 6144, 8, kBlocks,
+                                                              kUsePDL, kFuseRmsNorm,
+                                                              kCastBfloatForNorm>;
+      return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+    }
+    if (num_batch <= 296) {
+      // Retained path: 768 threads per block, one block per row.
+      config.gridDim = dim3(num_batch);
+      config.blockDim = dim3(768);
+      auto& cattr = attrs[config.numAttrs++];
+      cattr.id = cudaLaunchAttributeClusterDimension;
+      cattr.val.clusterDim = {1, 1, 1};
+      auto launch = [&](auto aligned_tag) {
+        constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+        auto kernel = kernels::fuse_ihc_post_pre_retained_kernel<4, 6144, 8, 768,
+                                                                 kUsePDL, kFuseRmsNorm,
+                                                                 kCastBfloatForNorm,
+                                                                 kWeightsAligned>;
+        return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                  residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                  num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+      };
+      return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+    }
+    // Rows-2 path: 384 threads per block.
+    config.gridDim = dim3((num_batch + 1) / 2);
+    config.blockDim = dim3(384);
+    auto& cattr = attrs[config.numAttrs++];
+    cattr.id = cudaLaunchAttributeClusterDimension;
+    cattr.val.clusterDim = {1, 1, 1};
+    auto launch = [&](auto aligned_tag) {
+      constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+      auto kernel = kernels::fuse_ihc_post_pre_kernel<4, 6144, 8, 384, 2,
+                                                      kUsePDL, kFuseRmsNorm, kCastBfloatForNorm,
+                                                      kWeightsAligned>;
+      return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+    };
+    return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
   } else {
+    // 3072 / 4096: cluster path for small batch, rows path otherwise.
     static_assert(kHiddenDim == 4096 || kHiddenDim == 3072, "supported hidden dimensions");
-    constexpr int kClusterBlocks = kernels::ihc_post_pre_cluster_blocks(kHiddenDim);
-    blocks = num_batch <= 128 ? kClusterBlocks : 1;
+    constexpr int kClusterBlocks = kernels::ihc_post_pre_num_blocks(kHiddenDim);
+    constexpr int kClusterThreads = kHiddenDim / (kClusterBlocks * 8);
+    if (num_batch <= 128) {
+      config.gridDim = dim3(num_batch * kClusterBlocks);
+      config.blockDim = dim3(kClusterThreads);
+      auto& cattr = attrs[config.numAttrs++];
+      cattr.id = cudaLaunchAttributeClusterDimension;
+      cattr.val.clusterDim = {kClusterBlocks, 1, 1};
+      auto kernel = kernels::fuse_ihc_post_pre_cluster_kernel<4, kHiddenDim, 8, kClusterBlocks,
+                                                              kUsePDL, kFuseRmsNorm,
+                                                              kCastBfloatForNorm>;
+      return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+    }
     const int rows = num_batch >= 297 ? 2 : 1;
-    config.gridDim = dim3(((num_batch + rows - 1) / rows) * blocks);
-    config.blockDim = dim3(blocks > 1 ? kHiddenDim / (kClusterBlocks * 8) : kThreads);
+    config.gridDim = dim3((num_batch + rows - 1) / rows);
+    config.blockDim = dim3(kThreads);
+    auto& cattr = attrs[config.numAttrs++];
+    cattr.id = cudaLaunchAttributeClusterDimension;
+    cattr.val.clusterDim = {1, 1, 1};
+    if (rows == 2) {
+      auto launch = [&](auto aligned_tag) {
+        constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+        auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, 2,
+                                                        kUsePDL, kFuseRmsNorm, kCastBfloatForNorm,
+                                                        kWeightsAligned>;
+        return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                  residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                  num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+      };
+      return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
+    }
+    auto launch = [&](auto aligned_tag) {
+      constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
+      auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, 1,
+                                                      kUsePDL, kFuseRmsNorm, kCastBfloatForNorm,
+                                                      kWeightsAligned>;
+      return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr,
+                                residual_ptr, H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr,
+                                num_batch, norm_eps, hc_eps, magnitude, rms_weight_ptr, rms_eps);
+    };
+    return weights_aligned ? launch(std::true_type{}) : launch(std::false_type{});
   }
-  auto& attr = attrs[config.numAttrs++];
-  attr.id = cudaLaunchAttributeClusterDimension;
-  attr.val.clusterDim.x = blocks;
-  attr.val.clusterDim.y = 1;
-  attr.val.clusterDim.z = 1;
   auto launch = [&](auto aligned_tag) {
     constexpr bool kWeightsAligned = decltype(aligned_tag)::value;
-    auto kernel =
-        kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, kUsePDL, kFuseRmsNorm,
-                                          kCastBfloatForNorm, kWeightsAligned>;
+    auto kernel = kernels::fuse_ihc_post_pre_kernel<4, kHiddenDim, 8, kThreads, 1,
+                                                    kUsePDL, kFuseRmsNorm, kCastBfloatForNorm,
+                                                    kWeightsAligned>;
     return cudaLaunchKernelEx(&config, kernel, y_ptr, z_ptr, H_post_out_ptr, xa_ptr, residual_ptr,
                               H_post_in_ptr, w_ptr, hc_scale_ptr, hc_base_ptr, num_batch, norm_eps,
                               hc_eps, magnitude, rms_weight_ptr, rms_eps);
@@ -2083,7 +2168,6 @@ struct PostConfig {
 };
 
 constexpr PostConfig post_config(int num_batch, int hidden_dim) {
-  (void)num_batch;
   int threads = kPostThreadsPerBlock;
 #if HPC_TARGET_ARCH != 90
   if (hidden_dim == 4096 && num_batch >= 4096) {

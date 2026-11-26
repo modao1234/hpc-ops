@@ -284,32 +284,19 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
 }
 
 
-namespace {
-
-constexpr int kStage1Threads = 128;
-constexpr int kStage2Threads = 256;
-constexpr int kElementsPerThread = 8;
+static constexpr int kStage1Threads = 128;
+static constexpr int kStage2Threads = 256;
+static constexpr int kElementsPerThread = 8;
 
 // Force controls: 0=automatic dispatch, 1=split-K, 2=row kernel.
-#ifndef HPC_IHC_SPLITK_FORCE
-#define HPC_IHC_SPLITK_FORCE 0
-#endif
-
-#ifndef HPC_IHC_HEAD_SPLITK_FORCE
-#define HPC_IHC_HEAD_SPLITK_FORCE 0
-#endif
+static int g_ihc_splitk_force = 0;
+static int g_ihc_head_splitk_force = 0;
 
 // Split-K applies below a device- and shape-dependent token threshold.
-int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
-#if HPC_IHC_SPLITK_FORCE == 1
-  (void)hidden_dim;
-  (void)fuse_rms_norm;
-  return 1 << 30;
-#elif HPC_IHC_SPLITK_FORCE == 2
-  (void)hidden_dim;
-  (void)fuse_rms_norm;
-  return 0;
-#else
+static int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
+  if (g_ihc_splitk_force == 1) return 1 << 30;
+  if (g_ihc_splitk_force == 2) return 0;
+
   constexpr float kSmPerBlockRow = 1.2f;
   constexpr float kFoldScale = 1.2f;
   constexpr int kHiddenRef = 6144;
@@ -324,10 +311,9 @@ int splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   const float hidden_scale = sqrtf(static_cast<float>(hidden_dim) / kHiddenRef);
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
-#endif
 }
 
-constexpr int splitk_block_k(int num_batch) {
+static constexpr int splitk_block_k(int num_batch) {
 #if HPC_TARGET_ARCH == 90
   if (num_batch < 2) {
     return 1024;
@@ -341,7 +327,7 @@ constexpr int splitk_block_k(int num_batch) {
 #endif
 }
 
-constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
+static constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
 #if HPC_TARGET_ARCH == 90
   (void)hidden_dim;
   if (num_batch < 2) {
@@ -365,16 +351,9 @@ constexpr int head_splitk_block_k(int num_batch, int hidden_dim) {
 #endif
 }
 
-int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
-#if HPC_IHC_HEAD_SPLITK_FORCE == 1
-  (void)hidden_dim;
-  (void)fuse_rms_norm;
-  return 1 << 30;
-#elif HPC_IHC_HEAD_SPLITK_FORCE == 2
-  (void)hidden_dim;
-  (void)fuse_rms_norm;
-  return 0;
-#else
+static int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
+  if (g_ihc_head_splitk_force == 1) return 1 << 30;
+  if (g_ihc_head_splitk_force == 2) return 0;
   constexpr float kSmPerBlockRow = 0.75f;
   constexpr float kFoldScale = 0.8f;
   constexpr int kHiddenRef = 6144;
@@ -389,7 +368,6 @@ int head_splitk_token_threshold(int hidden_dim, bool fuse_rms_norm) {
   const float hidden_scale = static_cast<float>(hidden_dim) / kHiddenRef;
   const float fold_scale = fuse_rms_norm ? kFoldScale : 1.0f;
   return static_cast<int>(sm_count * kSmPerBlockRow * hidden_scale * fold_scale);
-#endif
 }
 
 template <int kHiddenDim, int kBlockK, bool kFuseRmsNorm = false, bool kCastBfloatForNorm = false,
@@ -485,7 +463,8 @@ void launch_splitk_by_block_k(__nv_bfloat16* output_y_ptr, float* output_H_post_
   }
 }
 
-}  // namespace
+void ihc_set_splitk_force(int mode) { g_ihc_splitk_force = mode; }
+void ihc_set_head_splitk_force(int mode) { g_ihc_head_splitk_force = mode; }
 
 bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm) {
   if (hc_mult != 4) {

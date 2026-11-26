@@ -41,6 +41,10 @@ void fuse_ihc_head_async(__nv_bfloat16* output_ptr, const __nv_bfloat16* x_ptr, 
 // Split-K pre dispatch uses a device-specific token threshold.
 namespace splitk {
 
+// Force controls for testing: 0=auto, 1=force split-K, 2=force row kernel.
+void ihc_set_splitk_force(int mode);
+void ihc_set_head_splitk_force(int mode);
+
 bool ihc_pre_splitk_supported(int num_batch, int hc_mult, int hidden_dim, bool fuse_rms_norm);
 
 size_t ihc_pre_splitk_scratch_floats(int num_batch, int hc_mult, int hidden_dim,
