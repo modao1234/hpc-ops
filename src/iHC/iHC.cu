@@ -1047,12 +1047,22 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
   using LDB = cute::ComposedLayout<cute::Swizzle<3, 4, 3>, cute::smem_ptr_flag_bits<16>,
                                    cute::Layout<cute::Shape<cute::Int<8 * Parts>, cute::_64>,
                                                 cute::Stride<cute::_64, cute::_1>>>;
-  auto ta =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LDA{});
-  auto tb =
-      cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LDB{});
-  const uint64_t ad = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(ta);
-  const uint64_t bd = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(tb);
+  // Pre-compute per-slot UMMA descriptors from the LDA/LDB half-tile layouts.
+  // kDescStepPerKTile: each k-tile covers 16 bfloat16 elements = 32 bytes;
+  // UMMA descriptor unit = 16 bytes → 2 units per k-tile step.
+  constexpr int kDescStepPerKTile = (16 * static_cast<int>(sizeof(cute::bfloat16_t))) / 16;
+  const uint64_t ad_slot[2] = {
+      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
+          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[0])), LDA{})),
+      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
+          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.a[1])), LDA{})),
+  };
+  const uint64_t bd_slot[2] = {
+      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
+          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[0])), LDB{})),
+      cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(cute::make_tensor(
+          cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(s.b[1])), LDB{})),
+  };
   const auto id =
       cute::UMMA::make_runtime_instr_desc<cute::bfloat16_t, cute::bfloat16_t, float, 64, 8 * Parts,
                                           cute::UMMA::Major::K, cute::UMMA::Major::K>();
@@ -1123,8 +1133,8 @@ __global__ void fuse_ihc_post_pre_umma_kernel(__nv_bfloat16* y, __nv_bfloat16* z
       if (tid < 32) {
 #pragma unroll
         for (int k = 0; k < BK; k += 16)
-          MMA::fma(ad + (sizeof(s.a[0]) / 16) * slot + LA{}.layout_b()(0, k) / 8,
-                   bd + (sizeof(s.b[0]) / 16) * slot + LB{}.layout_b()(0, k) / 8,
+          MMA::fma(ad_slot[slot] + (k / 16) * kDescStepPerKTile,
+                   bd_slot[slot] + (k / 16) * kDescStepPerKTile,
                    s.tmem + ((tile % Groups) / 2) * (8 * Parts) + (((tile % Groups) & 1) << 20),
                    (tile >= Groups || k != 0), id);
         cutlass::arch::umma_arrive(&s.barrier[slot]);
